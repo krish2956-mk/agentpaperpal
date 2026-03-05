@@ -1,0 +1,88 @@
+{
+  "style_name": "APA 7th Edition",
+  "document": {
+    "font": "Times New Roman",
+    "font_size": 12,
+    "line_spacing": 2.0,
+    "margins": {
+      "top": 1.0,
+      "bottom": 1.0,
+      "left": 1.0,
+      "right": 1.0,
+      "unit": "inches"
+    }
+  },
+  "abstract": {
+    "label": "Abstract",
+    "label_bold": false,
+    "label_centered": true,
+    "max_words": 250,
+    "indent": false
+  },
+  "keywords": {
+    "label": "Keywords:",
+    "label_italic": true,
+    "position": "after_abstract"
+  },
+  "headings": {
+    "H1": {
+      "bold": true,
+      "centered": true,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": false
+    },
+    "H2": {
+      "bold": true,
+      "centered": false,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": false
+    },
+    "H3": {
+      "bold": true,
+      "centered": false,
+      "italic": true,
+      "case": "Title Case",
+      "indent": true,
+      "numbering": false
+    }
+  },
+  "citations": {
+    "style": "author-date",
+    "one_author": "(Author, Year)",
+    "two_authors": "(Author1 & Author2, Year)",
+    "three_plus": "(Author1 et al., Year)",
+    "direct_quote": "(Author, Year, p. PageNum)"
+  },
+  "references": {
+    "section_label": "References",
+    "label_bold": false,
+    "label_centered": true,
+    "ordering": "alphabetical",
+    "hanging_indent": true,
+    "hanging_indent_inches": 0.5,
+    "journal_article_format": "Author, A. A. (Year). Title of article. Journal Name, Volume(Issue), Pages. https://doi.org/xxxxx",
+    "doi_required": true
+  },
+  "figures": {
+    "label_format": "Figure N",
+    "label_bold": true,
+    "caption_position": "below",
+    "caption_italic": false,
+    "note_label": "Note."
+  },
+  "tables": {
+    "label_format": "Table N",
+    "label_bold": true,
+    "caption_position": "above",
+    "borders": "top_bottom_header_only",
+    "note_label": "Note."
+  },
+  "title_page": {
+    "title_centered": true,
+    "author_centered": true,
+    "affiliation_centered": true,
+    "running_head": true
+  }
+}

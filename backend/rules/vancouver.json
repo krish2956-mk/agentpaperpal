@@ -1,0 +1,84 @@
+{
+  "style_name": "Vancouver",
+  "document": {
+    "font": "Times New Roman",
+    "font_size": 12,
+    "line_spacing": 2.0,
+    "margins": {
+      "top": 1.0,
+      "bottom": 1.0,
+      "left": 1.25,
+      "right": 1.25,
+      "unit": "inches"
+    }
+  },
+  "abstract": {
+    "label": "Abstract",
+    "label_bold": true,
+    "label_centered": false,
+    "max_words": 300,
+    "structured": true,
+    "structured_sections": ["Background", "Methods", "Results", "Conclusions"]
+  },
+  "keywords": {
+    "label": "Keywords:",
+    "label_bold": true,
+    "position": "after_abstract",
+    "separator": ";"
+  },
+  "headings": {
+    "H1": {
+      "bold": true,
+      "centered": false,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": false
+    },
+    "H2": {
+      "bold": true,
+      "centered": false,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": false
+    },
+    "H3": {
+      "bold": false,
+      "centered": false,
+      "italic": true,
+      "case": "Title Case",
+      "numbering": false
+    }
+  },
+  "citations": {
+    "style": "numbered",
+    "format": "(N)",
+    "one_author": "(N)",
+    "two_authors": "(N)",
+    "three_plus": "(N)",
+    "ordering": "appearance",
+    "superscript_option": true
+  },
+  "references": {
+    "section_label": "References",
+    "label_bold": true,
+    "label_centered": false,
+    "ordering": "appearance",
+    "hanging_indent": true,
+    "hanging_indent_inches": 0.5,
+    "journal_article_format": "N. Author AA, Author BB. Title of article. Journal Abbreviation. Year;Volume(Issue):Pages.",
+    "max_authors_before_et_al": 6,
+    "et_al_trigger": 7
+  },
+  "figures": {
+    "label_format": "Figure N",
+    "label_bold": true,
+    "caption_position": "below",
+    "caption_italic": false
+  },
+  "tables": {
+    "label_format": "Table N",
+    "label_bold": true,
+    "caption_position": "above",
+    "borders": "horizontal_only"
+  }
+}

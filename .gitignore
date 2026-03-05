@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Environment
+backend/.env
+frontend/.env
+.env
+
+# Uploaded/generated files
+backend/uploads/
+backend/outputs/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/settings.json

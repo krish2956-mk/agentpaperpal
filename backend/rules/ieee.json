@@ -1,0 +1,88 @@
+{
+  "style_name": "IEEE",
+  "document": {
+    "font": "Times New Roman",
+    "font_size": 10,
+    "line_spacing": 1.0,
+    "columns": 2,
+    "margins": {
+      "top": 0.75,
+      "bottom": 1.0,
+      "left": 0.625,
+      "right": 0.625,
+      "unit": "inches"
+    }
+  },
+  "abstract": {
+    "label": "Abstract",
+    "label_bold": true,
+    "label_centered": false,
+    "label_italic": true,
+    "max_words": 250,
+    "indent": false
+  },
+  "keywords": {
+    "label": "Index Terms",
+    "label_italic": true,
+    "position": "after_abstract"
+  },
+  "headings": {
+    "H1": {
+      "bold": false,
+      "centered": true,
+      "italic": false,
+      "case": "UPPERCASE",
+      "numbering": true,
+      "number_format": "Roman"
+    },
+    "H2": {
+      "bold": true,
+      "centered": false,
+      "italic": true,
+      "case": "Title Case",
+      "numbering": true,
+      "number_format": "Alpha"
+    },
+    "H3": {
+      "bold": false,
+      "centered": false,
+      "italic": true,
+      "case": "Title Case",
+      "numbering": true,
+      "number_format": "Numeric"
+    }
+  },
+  "citations": {
+    "style": "numbered",
+    "format": "[N]",
+    "one_author": "[N]",
+    "two_authors": "[N]",
+    "three_plus": "[N]",
+    "ordering": "appearance"
+  },
+  "references": {
+    "section_label": "References",
+    "label_bold": false,
+    "label_centered": false,
+    "label_case": "UPPERCASE",
+    "ordering": "appearance",
+    "hanging_indent": true,
+    "hanging_indent_inches": 0.25,
+    "journal_article_format": "[N] A. Author, \"Title of article,\" Journal Name, vol. X, no. Y, pp. ZZ-ZZ, Month Year.",
+    "doi_required": false
+  },
+  "figures": {
+    "label_format": "Fig. N.",
+    "label_bold": false,
+    "caption_position": "below",
+    "caption_italic": false,
+    "label_case": "normal"
+  },
+  "tables": {
+    "label_format": "TABLE N",
+    "label_bold": true,
+    "caption_position": "above",
+    "borders": "full_grid",
+    "label_case": "UPPERCASE"
+  }
+}

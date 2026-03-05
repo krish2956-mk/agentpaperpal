@@ -1,0 +1,86 @@
+{
+  "style_name": "Springer",
+  "document": {
+    "font": "Times New Roman",
+    "font_size": 12,
+    "line_spacing": 1.5,
+    "margins": {
+      "top": 1.0,
+      "bottom": 1.0,
+      "left": 1.0,
+      "right": 1.0,
+      "unit": "inches"
+    }
+  },
+  "abstract": {
+    "label": "Abstract",
+    "label_bold": true,
+    "label_centered": false,
+    "max_words": 300,
+    "indent": false
+  },
+  "keywords": {
+    "label": "Keywords:",
+    "label_bold": true,
+    "position": "after_abstract",
+    "min_count": 4,
+    "max_count": 6,
+    "separator": " · "
+  },
+  "headings": {
+    "H1": {
+      "bold": true,
+      "centered": false,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": true,
+      "number_format": "Numeric"
+    },
+    "H2": {
+      "bold": true,
+      "centered": false,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": true,
+      "number_format": "Numeric_Dot"
+    },
+    "H3": {
+      "bold": false,
+      "centered": false,
+      "italic": true,
+      "case": "Title Case",
+      "numbering": true,
+      "number_format": "Numeric_Dot_Dot"
+    }
+  },
+  "citations": {
+    "style": "author-date",
+    "one_author": "(Author Year)",
+    "two_authors": "(Author1 and Author2 Year)",
+    "three_plus": "(Author1 et al. Year)",
+    "direct_quote": "(Author Year, p. PageNum)"
+  },
+  "references": {
+    "section_label": "References",
+    "label_bold": true,
+    "label_centered": false,
+    "ordering": "alphabetical",
+    "hanging_indent": true,
+    "hanging_indent_inches": 0.5,
+    "journal_article_format": "Author AA, Author BB (Year) Title of article. Journal Name Volume:Pages. https://doi.org/xxxxx",
+    "doi_required": true
+  },
+  "figures": {
+    "label_format": "Fig. N",
+    "label_bold": true,
+    "caption_position": "below",
+    "caption_italic": false
+  },
+  "tables": {
+    "label_format": "Table N",
+    "label_bold": true,
+    "caption_position": "above",
+    "borders": "horizontal_only",
+    "footer_notes": true
+  }
+}

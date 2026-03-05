@@ -1,0 +1,80 @@
+{
+  "style_name": "Chicago",
+  "document": {
+    "font": "Times New Roman",
+    "font_size": 12,
+    "line_spacing": 2.0,
+    "margins": {
+      "top": 1.0,
+      "bottom": 1.0,
+      "left": 1.0,
+      "right": 1.0,
+      "unit": "inches"
+    }
+  },
+  "abstract": {
+    "label": "Abstract",
+    "label_bold": false,
+    "label_centered": true,
+    "max_words": 300,
+    "indent": false
+  },
+  "keywords": {
+    "label": "Keywords:",
+    "label_italic": false,
+    "position": "after_abstract"
+  },
+  "headings": {
+    "H1": {
+      "bold": true,
+      "centered": true,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": false
+    },
+    "H2": {
+      "bold": true,
+      "centered": false,
+      "italic": false,
+      "case": "Title Case",
+      "numbering": false
+    },
+    "H3": {
+      "bold": false,
+      "centered": false,
+      "italic": true,
+      "case": "Title Case",
+      "numbering": false
+    }
+  },
+  "citations": {
+    "style": "author-date",
+    "one_author": "(Author Year)",
+    "two_authors": "(Author1 and Author2 Year)",
+    "three_plus": "(Author1 et al. Year)",
+    "footnote_option": true,
+    "footnote_format": "Author, Title, Page."
+  },
+  "references": {
+    "section_label": "Bibliography",
+    "label_bold": false,
+    "label_centered": true,
+    "ordering": "alphabetical",
+    "hanging_indent": true,
+    "hanging_indent_inches": 0.5,
+    "journal_article_format": "Author, First. \"Title of Article.\" Journal Name Volume, no. Issue (Year): Pages.",
+    "doi_required": false
+  },
+  "figures": {
+    "label_format": "Figure N",
+    "label_bold": false,
+    "caption_position": "below",
+    "caption_italic": true
+  },
+  "tables": {
+    "label_format": "Table N",
+    "label_bold": false,
+    "caption_position": "above",
+    "borders": "horizontal_only"
+  }
+}
