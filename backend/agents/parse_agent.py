@@ -3,6 +3,8 @@ Agent 2: PARSE — Extract complete structured metadata from labelled paper text
 
 Consumes the labelled_text produced by the Ingest agent and returns a strict
 paper_structure JSON consumed by the Transform and Validate agents.
+
+Schema matches APA_Pipeline_Complete_Prompts.md §3 exactly.
 """
 import time
 from typing import Any
@@ -10,31 +12,25 @@ from typing import Any
 from crewai import Agent
 
 from tools.logger import get_logger
-from tools.tool_errors import LLMResponseError, ParseError  # noqa: F401 — available for callers
+from tools.tool_errors import LLMResponseError, ParseError  # noqa: F401
 
 logger = get_logger(__name__)
 
-# Required top-level keys in paper_structure output (Improvement 3)
+# Required top-level keys in paper_structure output
 REQUIRED_FIELDS = [
-    "title", "authors", "abstract", "keywords",
-    "imrad", "sections", "figures", "tables", "references", "metadata",
+    "metadata", "title", "authors", "affiliations", "abstract",
+    "keywords", "sections", "figures", "tables", "citations",
+    "references",
 ]
+
 
 def _validate_parse_output(data: dict) -> None:
     """
     Validate that parse output contains all required top-level fields.
 
     Performs cross-agent sanity checks:
-      - All 10 REQUIRED_FIELDS present
+      - All REQUIRED_FIELDS present
       - sections is non-empty
-      - metadata.total_references == len(references)
-
-    Args:
-        data: Parsed paper_structure dict.
-
-    Raises:
-        ParseError: If required fields are missing or sections is empty.
-        LLMResponseError: If data is not a dict.
     """
     if not isinstance(data, dict):
         raise LLMResponseError(
@@ -52,17 +48,7 @@ def _validate_parse_output(data: dict) -> None:
             "transform a paper with no detected sections."
         )
 
-    # Cross-agent sanity: total_references must match actual list (Improvement 10)
     refs = data.get("references", [])
-    meta = data.get("metadata", {})
-    meta_total = meta.get("total_references", -1)
-    if meta_total != -1 and meta_total != len(refs):
-        logger.warning(
-            "[PARSE] Sanity check failed: metadata.total_references=%d != "
-            "len(references)=%d — downstream agents will use len(references)",
-            meta_total, len(refs),
-        )
-
     logger.info(
         "[PARSE] Validation passed — sections=%d refs=%d figures=%d tables=%d",
         len(sections),
@@ -73,118 +59,152 @@ def _validate_parse_output(data: dict) -> None:
 
 
 def _safe_context(context: dict, key: str) -> Any:
-    """
-    Defensively access a required key from a pipeline context dict.
-
-    Args:
-        context: Pipeline context dictionary.
-        key: Required key name.
-
-    Returns:
-        Value at context[key].
-
-    Raises:
-        ValueError: If key is absent.
-    """
     if key not in context:
         raise ValueError(f"Pipeline context missing required key: '{key}'")
     return context[key]
+
+
+# ── System prompt from APA_Pipeline_Complete_Prompts.md §3 ──────────────────
+PARSE_SYSTEM_PROMPT = """You are a structured data extractor. You receive a labeled academic paper (output from the INGEST agent) and extract a structured JSON object containing every paper element.
+
+## YOUR TASK
+
+Parse the labeled text and produce a JSON object with the following schema.
+
+## OUTPUT JSON SCHEMA
+
+{
+  "metadata": {
+    "citation_style": "numbered | author-date",
+    "source_format": "NLM | APA | other",
+    "paper_type": "research | review | meta-analysis | case-study | other"
+  },
+  "title": "Full paper title as single string",
+  "authors": [
+    {
+      "name": "Full Name",
+      "affiliations": ["a", "b"],
+      "is_corresponding": true/false,
+      "email": "if available"
+    }
+  ],
+  "affiliations": [
+    {"key": "a", "institution": "...", "address": "..."}
+  ],
+  "abstract": {
+    "text": "Full abstract text as single paragraph",
+    "word_count": 150,
+    "has_explicit_label": true/false
+  },
+  "keywords": ["keyword1", "keyword2"],
+  "significance": "Significance paragraph text if present, else null",
+  "sections": [
+    {
+      "heading": "Introduction",
+      "level": 1,
+      "content": "Full section body text. Merge all paragraphs belonging to this section.",
+      "subsections": [
+        {
+          "heading": "Subsection Title",
+          "level": 2,
+          "content": "Subsection body text"
+        }
+      ]
+    }
+  ],
+  "figures": [
+    {
+      "number": 1,
+      "caption": "Full caption text starting from Fig. 1..."
+    }
+  ],
+  "tables": [
+    {
+      "number": 1,
+      "caption": "Full table caption"
+    }
+  ],
+  "citations": [
+    {
+      "id": "1",
+      "original_text": "(1)",
+      "context": "5 words before and after the citation",
+      "in_text_format": "numbered"
+    }
+  ],
+  "references": [
+    {
+      "id": "1",
+      "original_text": "Full reference as written in paper",
+      "parsed": {
+        "authors": [{"last": "Nataro", "initials": "JP"}],
+        "year": 1998,
+        "title": "Article title",
+        "journal": "Clin Microbiol Rev",
+        "volume": "11",
+        "issue": "1",
+        "pages": "142-201",
+        "doi": "if available"
+      }
+    }
+  ],
+  "acknowledgments": "Acknowledgments text if present",
+  "author_contributions": "Author contributions text if present",
+  "journal_metadata": {
+    "journal": "PNAS",
+    "volume": "112",
+    "issue": "17",
+    "pages": "5503-5508",
+    "doi": "10.1073/pnas.1422986112",
+    "received_date": "December 2, 2014",
+    "accepted_date": "March 25, 2015"
+  }
+}
+
+## CRITICAL RULES
+
+1. Preserve ALL text verbatim in content fields — never summarize or truncate.
+2. Parse EVERY reference into its component parts (authors, year, title, journal, etc.).
+3. For author names: separate last name and initials. "Nataro JP" → last: "Nataro", initials: "JP"
+4. For "et al." references: include the named authors and mark has_et_al: true.
+5. Count abstract words accurately.
+6. Map each citation in the text to its corresponding reference ID.
+7. The sections array must follow the paper's actual order.
+8. Merge partial paragraphs that were split by PDF extraction into complete paragraphs.
+
+## OUTPUT
+
+Return ONLY valid JSON. No markdown, no explanation, no backticks."""
 
 
 def create_parse_agent(llm: Any) -> Agent:
     """
     Agent 2: PARSE — Produce paper_structure JSON from labelled text.
 
-    Output schema (all 10 top-level keys REQUIRED):
-      title          : str
-      authors        : list[str]
-      abstract       : {text: str, word_count: int}
-      keywords       : list[str]
-      imrad          : {introduction: bool, methods: bool, results: bool, discussion: bool}
-      sections       : list[{heading: str, level: int(1/2/3), content_preview: str,
-                             in_text_citations: list[str], word_count: int}]
-      figures        : list[{id: str, caption: str}]
-      tables         : list[{id: str, caption: str}]
-      references     : list[str]  — each complete reference as one string
-      metadata       : {total_words: int, total_sections: int, total_figures: int,
-                        total_tables: int, total_references: int,
-                        citation_style_detected: str (author-date|numbered|mixed|unknown),
-                        has_doi: bool}
-
-    Validation rules enforced post-parse:
-      - sections must NOT be empty (raises ParseError)
-      - abstract.word_count recalculated if 0 but text is not empty
-      - metadata.total_references overridden with len(references) if mismatched
-      - All list fields default to [] if content is absent
-      - All boolean fields default to false if absent
-
-    Args:
-        llm: Shared LLM string at temperature=0.
-
-    Returns:
-        CrewAI Agent configured for structural parsing.
+    Uses the comprehensive schema from APA Pipeline spec.
     """
     logger.info("[PARSE] Agent created")
 
     return Agent(
         role="Academic Paper Structure Extractor",
-        goal=(
-            "Extract the complete structural metadata from the labelled paper text "
-            "and return it as a single valid JSON object.\n\n"
-            "OUTPUT SCHEMA — all 10 top-level keys are REQUIRED:\n"
-            "  title (str) — full paper title\n"
-            "  authors (list[str]) — one entry per author\n"
-            "  abstract: {text: str, word_count: int} — full abstract text, accurate word count\n"
-            "  keywords (list[str]) — individual keywords/phrases\n"
-            "  imrad: {introduction: bool, methods: bool, results: bool, discussion: bool}\n"
-            "  sections: list of {heading: str, level: int (1/2/3), "
-            "    content_preview: str (first 200 chars of section body), "
-            "    in_text_citations: list[str] (unique citations in this section), "
-            "    word_count: int (words in section body)}\n"
-            "  figures: list of {id: str (e.g. 'Figure 1'), caption: str}\n"
-            "  tables:  list of {id: str (e.g. 'Table 1'),  caption: str}\n"
-            "  references: list[str] — each complete reference as one string\n"
-            "  metadata: {total_words: int, total_sections: int, total_figures: int,\n"
-            "             total_tables: int, total_references: int,\n"
-            "             citation_style_detected: str (author-date|numbered|mixed|unknown),\n"
-            "             has_doi: bool}\n\n"
-            "STRICT RULES:\n"
-            "  1. Return ONLY valid JSON — no markdown fences, no prose, no explanation\n"
-            "  2. sections MUST NOT be empty — if no sections found, raise ParseError\n"
-            "  3. Use [] for any list field where content is absent in the paper\n"
-            "  4. Use false for any boolean field where the element is absent\n"
-            "  5. word_count: count space-separated tokens accurately\n"
-            "  6. citation_style_detected: 'numbered' if citations are [1] or (1);\n"
-            "     'author-date' if (Smith, 2020) or (Smith et al., 2020);\n"
-            "     'mixed' if both styles appear; 'unknown' if none detected\n"
-            "  7. has_doi: true if any reference contains 'doi' or 'https://doi.org'\n"
-            "  8. metadata.total_references MUST equal len(references)\n"
-            "  9. If abstract.word_count is 0 but abstract.text is non-empty, recalculate\n"
-            " 10. Preserve Unicode and special characters in reference strings exactly\n\n"
-            "VALIDATION SELF-CHECK (before returning):\n"
-            "  - Confirm all 10 top-level keys are present\n"
-            "  - Confirm sections list has at least 1 entry\n"
-            "  - Confirm metadata.total_references == len(references)\n"
-            "  - Confirm your JSON is parseable (no trailing commas, no single quotes)\n"
-            "  If any check fails, fix your output before returning."
-        ),
+        goal=PARSE_SYSTEM_PROMPT,
         backstory=(
             "You are a precision data extraction specialist trained on academic publishing "
             "metadata standards. You have extracted structured data from over 100,000 research "
             "papers across all major scientific publishers: Elsevier, Springer, IEEE, Nature, "
             "PLOS, and Wiley. "
             "You produce deterministic, schema-compliant JSON every single time — your output is "
-            "consumed directly by the Transform and Validate agents with no human review or "
-            "correction. You count words with mathematical precision, detect citation styles by "
-            "scanning inline patterns systematically, and always include every required field "
-            "even when the corresponding content is absent (using empty defaults). "
-            "You never hallucinate content — every value you output is grounded in the actual "
-            "document text. You never omit a field or change the schema structure. "
-            "Before returning, you mentally run a self-check: all 10 keys present, sections "
-            "non-empty, total_references matches references list length. Only then do you output."
+            "consumed directly by the Transform and Validate agents with no human review. "
+            "You parse EVERY reference into its component parts: authors, year, title, journal, "
+            "volume, issue, pages, DOI. You detect citation styles by scanning inline patterns. "
+            "You count words with mathematical precision. "
+            "You never hallucinate content — every value is grounded in the actual document text. "
+            "Before returning, you self-check: all required keys present, sections non-empty, "
+            "references fully parsed."
         ),
         llm=llm,
         allow_delegation=False,
         verbose=True,
         max_iter=3,
+        max_tokens=16384,
     )

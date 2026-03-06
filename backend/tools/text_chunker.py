@@ -1,19 +1,9 @@
 """
 Section-aware text chunker for manuscript processing.
 
-Replaces naive head+tail truncation with intelligent section-aware splitting.
-Priority order ensures Abstract and References are ALWAYS fully preserved —
-the two sections most critical for compliance scoring.
-
-Preservation priority:
-  1. Preamble / title block  (always — contains journal/author metadata)
-  2. Abstract                (always — word count check, structured keywords)
-  3. References              (always — citation consistency, ordering check)
-  4. Introduction            (high — IMRAD structure check)
-  5. Methods / Materials     (medium — IMRAD structure check)
-  6. Results                 (medium — IMRAD structure check)
-  7. Discussion / Conclusion (medium — IMRAD structure check)
-  8. Keywords / Other        (low — included only if budget allows)
+Splits manuscript text into labeled IMRAD sections so crew.py can inject
+structured section context into agent prompts. No content is removed or
+truncated — the full paper is always passed to the LLM pipeline.
 """
 import re
 from dataclasses import dataclass, field
@@ -22,16 +12,16 @@ from tools.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Maximum characters sent to the LLM pipeline (safe under typical 32K token windows)
-MAX_CHARS = 32_000
-
-# Characters to include per section when truncating a large section
-_SECTION_PREVIEW_CHARS = 600
-
-_TRUNCATION_NOTE = "[... SECTION TRUNCATED — content continues in original document ...]"
+# NOTE: Truncation is disabled — Gemini 2.5 Flash has 1M token context window.
+# To re-enable, uncomment smart_truncate() below and call it in crew.py
+# before passing paper_content to the pipeline.
+#
+# _MAX_CHARS = 32_000
+# _SECTION_PREVIEW_CHARS = 600
+# _TRUNCATION_NOTE = "[... SECTION TRUNCATED — content continues in original document ...]"
+# _ALWAYS_FULL = {"abstract", "references", "bibliography", "preamble"}
 
 # Known section header strings — matched case-insensitively
-# Ordered to define IMRAD priority (index 0 = highest priority after preamble)
 _SECTION_ORDER: list[str] = [
     "abstract",
     "introduction",
@@ -55,9 +45,6 @@ _SECTION_ORDER: list[str] = [
     "appendix",
 ]
 
-# Sections that must be fully preserved regardless of budget
-_ALWAYS_FULL = {"abstract", "references", "bibliography", "preamble"}
-
 # Build a single regex that detects section header lines
 # Matches: a line that is ONLY a section header word (possibly with numbering like "1. Introduction")
 _HEADER_PATTERN = re.compile(
@@ -78,14 +65,14 @@ class _Section:
     def __post_init__(self) -> None:
         self.chars = len(self.text)
 
-    def priority(self) -> int:
-        """Lower = higher priority. Preamble = 0, unknown = 999."""
-        if self.name == "preamble":
-            return 0
-        try:
-            return _SECTION_ORDER.index(self.name) + 1
-        except ValueError:
-            return 999
+    # def priority(self) -> int:
+    #     """Lower = higher priority. Preamble = 0, unknown = 999."""
+    #     if self.name == "preamble":
+    #         return 0
+    #     try:
+    #         return _SECTION_ORDER.index(self.name) + 1
+    #     except ValueError:
+    #         return 999
 
 
 def split_into_sections(text: str) -> list[_Section]:
@@ -138,109 +125,60 @@ def split_into_sections(text: str) -> list[_Section]:
     return sections
 
 
-def smart_truncate(text: str, max_chars: int = MAX_CHARS) -> str:
-    """
-    Intelligently truncate a manuscript to fit within max_chars.
-
-    If the text already fits, returns it unchanged.
-
-    Otherwise:
-      1. Split into sections
-      2. Always include preamble, abstract, references in full
-      3. Fill remaining budget with IMRAD sections in priority order
-      4. Sections that don't fit are included as header + preview + truncation note
-      5. Always ends with the references section (critical for compliance)
-
-    Args:
-        text: Full extracted manuscript text.
-        max_chars: Maximum characters to return (default 32 000).
-
-    Returns:
-        String of at most max_chars characters with [TRUNCATED] markers where needed.
-    """
-    if len(text) <= max_chars:
-        return text
-
-    sections = split_into_sections(text)
-    total_original = len(text)
-
-    # Separate into: must-have (always full) vs optional (fill if budget allows)
-    must_have: list[_Section] = []
-    optional:  list[_Section] = []
-
-    for sec in sections:
-        if sec.name in _ALWAYS_FULL:
-            must_have.append(sec)
-        else:
-            optional.append(sec)
-
-    # Sort optional sections by priority (IMRAD order)
-    optional.sort(key=lambda s: s.priority())
-
-    # Budget tracking
-    used = sum(s.chars for s in must_have)
-    remaining = max_chars - used
-
-    # Assign budget to optional sections
-    included:  list[_Section] = list(must_have)
-    truncated: list[_Section] = []
-
-    for sec in optional:
-        if remaining >= sec.chars:
-            included.append(sec)
-            remaining -= sec.chars
-        elif remaining >= _SECTION_PREVIEW_CHARS + 50:
-            # Include a preview — better than nothing
-            preview_text = (
-                sec.text[:_SECTION_PREVIEW_CHARS].rstrip()
-                + f"\n{_TRUNCATION_NOTE}"
-            )
-            truncated_sec = _Section(
-                name=sec.name,
-                raw_name=sec.raw_name,
-                text=preview_text,
-            )
-            truncated.append(truncated_sec)
-            included.append(truncated_sec)
-            remaining = 0
-            break
-        else:
-            # No budget left — add a stub so the LLM knows the section exists
-            stub = _Section(
-                name=sec.name,
-                raw_name=sec.raw_name,
-                text=f"{_TRUNCATION_NOTE}",
-            )
-            included.append(stub)
-
-    # Re-sort to document order (by original index)
-    name_order = {s.name: i for i, s in enumerate(sections)}
-    included.sort(key=lambda s: name_order.get(s.name, 999))
-
-    # Build the output string
-    parts: list[str] = []
-    for sec in included:
-        header = sec.raw_name if sec.raw_name != "preamble" else ""
-        if header:
-            parts.append(f"{header}\n{sec.text}")
-        else:
-            parts.append(sec.text)
-
-    result = "\n\n".join(parts)
-
-    truncated_names = [s.name for s in truncated]
-    dropped_names   = [
-        s.name for s in optional
-        if s.name not in {i.name for i in included}
-    ]
-
-    logger.warning(
-        "[CHUNKER] Paper truncated: %d → %d chars | "
-        "preserved=%s | truncated=%s | dropped=%s",
-        total_original, len(result),
-        [s.name for s in must_have] + [s.name for s in optional if s in included],
-        truncated_names,
-        dropped_names,
-    )
-
-    return result
+# ── smart_truncate — DISABLED (Gemini 2.5 Flash handles full papers) ──────────
+# Uncomment and call in crew.py if a smaller-context model is used in future.
+#
+# def smart_truncate(text: str, max_chars: int = _MAX_CHARS) -> str:
+#     """
+#     Intelligently truncate a manuscript to fit within max_chars.
+#     Always preserves: preamble, abstract, references in full.
+#     Fills remaining budget with IMRAD sections in priority order.
+#     Sections that don't fit get a preview + [TRUNCATED] marker.
+#     """
+#     if len(text) <= max_chars:
+#         return text
+#
+#     sections = split_into_sections(text)
+#     total_original = len(text)
+#
+#     must_have = [s for s in sections if s.name in _ALWAYS_FULL]
+#     optional  = sorted(
+#         [s for s in sections if s.name not in _ALWAYS_FULL],
+#         key=lambda s: s.priority(),
+#     )
+#
+#     used = sum(s.chars for s in must_have)
+#     remaining = max_chars - used
+#     included: list[_Section] = list(must_have)
+#     truncated: list[_Section] = []
+#
+#     for sec in optional:
+#         if remaining >= sec.chars:
+#             included.append(sec)
+#             remaining -= sec.chars
+#         elif remaining >= _SECTION_PREVIEW_CHARS + 50:
+#             preview = _Section(
+#                 name=sec.name, raw_name=sec.raw_name,
+#                 text=sec.text[:_SECTION_PREVIEW_CHARS].rstrip() + f"\n{_TRUNCATION_NOTE}",
+#             )
+#             truncated.append(preview)
+#             included.append(preview)
+#             remaining = 0
+#             break
+#         else:
+#             included.append(_Section(name=sec.name, raw_name=sec.raw_name, text=_TRUNCATION_NOTE))
+#
+#     name_order = {s.name: i for i, s in enumerate(sections)}
+#     included.sort(key=lambda s: name_order.get(s.name, 999))
+#
+#     parts = [
+#         (f"{s.raw_name}\n{s.text}" if s.raw_name != "preamble" else s.text)
+#         for s in included
+#     ]
+#     result = "\n\n".join(parts)
+#
+#     logger.warning(
+#         "[CHUNKER] Paper truncated: %d → %d chars | truncated=%s",
+#         total_original, len(result), [s.name for s in truncated],
+#     )
+#     return result

@@ -1,3 +1,19 @@
+"""
+DOCX Writer — Consumes docx_instructions from TRANSFORM agent.
+
+Two modes:
+  1. build_apa_docx(): New APA-specific writer that handles the section-based
+     format (title_page, abstract_page, body, references_page) from the
+     APA Pipeline prompts. This is the PRIMARY path for APA formatting.
+
+  2. write_formatted_docx(): Legacy generic writer for non-APA journals.
+     Handles flat section lists (title, heading, paragraph, reference, etc.).
+
+  3. transform_docx_in_place(): In-place transformation of uploaded DOCX files.
+     Preserves figures, tables, and embedded objects.
+
+Based on APA_Pipeline_Complete_Prompts.md §6.
+"""
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -6,7 +22,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor, Twips
 
 from tools.logger import get_logger
 from tools.tool_errors import DocumentWriteError
@@ -16,28 +32,412 @@ logger = get_logger(__name__)
 _CASE_OPTIONS = {"Title Case", "UPPERCASE", "Sentence case", "lowercase"}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# APA-SPECIFIC DOCX BUILDER (from APA Pipeline Prompts §6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_apa_docx(transform_output: dict, output_path: str) -> str:
+    """Main entry point: takes TRANSFORM agent JSON → produces APA DOCX file."""
+
+    instructions = transform_output.get("docx_instructions", transform_output)
+    sections_data = instructions.get("sections", [])
+
+    if not sections_data:
+        raise DocumentWriteError("docx_instructions must contain a non-empty 'sections' list.")
+
+    doc = Document()
+
+    # ── 1. SET DOCUMENT-LEVEL DEFAULTS ──
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = instructions.get("font", "Times New Roman")
+    # Support both field names: font_size_halfpoints (MD prompt) and font_size (legacy)
+    raw_size = instructions.get("font_size_halfpoints", instructions.get("font_size", 24))
+    font.size = Pt(raw_size / 2) if raw_size > 13 else Pt(raw_size)
+
+    paragraph_format = style.paragraph_format
+    paragraph_format.space_before = Pt(0)
+    paragraph_format.space_after = Pt(0)
+    paragraph_format.line_spacing = 2.0
+    paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # Set default font in XML
+    rpr = doc.styles['Normal'].element.get_or_add_rPr()
+    rFonts = OxmlElement('w:rFonts')
+    rFonts.set(qn('w:ascii'), 'Times New Roman')
+    rFonts.set(qn('w:hAnsi'), 'Times New Roman')
+    rFonts.set(qn('w:cs'), 'Times New Roman')
+    rpr.append(rFonts)
+
+    # ── 2. CONFIGURE HEADING STYLES ──
+    _configure_heading_styles(doc)
+
+    # ── 3. PROCESS EACH SECTION ──
+    first_section = True
+    for section_data in sections_data:
+        section_type = section_data.get("type", "body")
+
+        if section_type == "title_page":
+            _write_title_page(doc, section_data, instructions, first_section)
+        elif section_type == "abstract_page":
+            _write_abstract_page(doc, section_data, instructions)
+        elif section_type == "body":
+            _write_body(doc, section_data, instructions)
+        elif section_type == "references_page":
+            _write_references_page(doc, section_data, instructions)
+        else:
+            _write_body(doc, section_data, instructions)
+
+        first_section = False
+
+    # ── 4. SET PAGE SIZE & MARGINS ON ALL SECTIONS ──
+    page_size = instructions.get("page_size", {})
+    margins = instructions.get("margins", {})
+    for section in doc.sections:
+        section.page_width = Twips(page_size.get("width", 12240))
+        section.page_height = Twips(page_size.get("height", 15840))
+        section.top_margin = Twips(margins.get("top", 1440))
+        section.bottom_margin = Twips(margins.get("bottom", 1440))
+        section.left_margin = Twips(margins.get("left", 1440))
+        section.right_margin = Twips(margins.get("right", 1440))
+
+        _add_page_number_header(section)
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    logger.info("[DOCX_APA] Written | file=%s | sections=%d", out.name, len(sections_data))
+    return str(out)
+
+
+def _configure_heading_styles(doc):
+    """Set up APA heading styles in the document."""
+    h1 = doc.styles['Heading 1']
+    h1.font.name = 'Times New Roman'
+    h1.font.size = Pt(12)
+    h1.font.bold = True
+    h1.font.italic = False
+    h1.font.color.rgb = RGBColor(0, 0, 0)
+    h1.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    h1.paragraph_format.space_before = Pt(0)
+    h1.paragraph_format.space_after = Pt(0)
+    h1.paragraph_format.line_spacing = 2.0
+    h1.paragraph_format.first_line_indent = Inches(0)
+
+    h2 = doc.styles['Heading 2']
+    h2.font.name = 'Times New Roman'
+    h2.font.size = Pt(12)
+    h2.font.bold = True
+    h2.font.italic = False
+    h2.font.color.rgb = RGBColor(0, 0, 0)
+    h2.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h2.paragraph_format.space_before = Pt(0)
+    h2.paragraph_format.space_after = Pt(0)
+    h2.paragraph_format.line_spacing = 2.0
+    h2.paragraph_format.first_line_indent = Inches(0)
+
+    h3 = doc.styles['Heading 3']
+    h3.font.name = 'Times New Roman'
+    h3.font.size = Pt(12)
+    h3.font.bold = True
+    h3.font.italic = True
+    h3.font.color.rgb = RGBColor(0, 0, 0)
+    h3.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h3.paragraph_format.space_before = Pt(0)
+    h3.paragraph_format.space_after = Pt(0)
+    h3.paragraph_format.line_spacing = 2.0
+    h3.paragraph_format.first_line_indent = Inches(0.5)
+
+
+def _write_title_page(doc, section_data, instructions, is_first):
+    """Write the APA title page."""
+    if not is_first:
+        doc.add_section()
+
+    # Default 3 blank lines if no explicit spacing element comes first
+    elements = section_data.get("elements", [])
+    has_leading_spacing = elements and elements[0].get("type") == "spacing"
+    if not has_leading_spacing:
+        for _ in range(3):
+            p = doc.add_paragraph()
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+
+    for element in elements:
+        etype = element.get("type", "")
+
+        if etype == "spacing":
+            # Blank lines from the MD prompt schema
+            blank_lines = element.get("blank_lines", 1)
+            for _ in range(blank_lines):
+                p = doc.add_paragraph()
+                p.paragraph_format.line_spacing = 2.0
+                p.paragraph_format.space_before = Pt(0)
+                p.paragraph_format.space_after = Pt(0)
+
+        elif etype == "title":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            run = p.add_run(element.get("text", ""))
+            run.bold = element.get("bold", True)
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+
+        elif etype in ("authors", "affiliation"):
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            run = p.add_run(element.get("text", ""))
+            run.bold = False
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+
+
+def _write_abstract_page(doc, section_data, instructions):
+    """Write the APA abstract page."""
+    doc.add_section()
+
+    for element in section_data.get("elements", []):
+        etype = element.get("type", "")
+
+        if etype == "abstract_label":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.first_line_indent = Inches(0)
+            run = p.add_run(element.get("text", "Abstract"))
+            run.bold = element.get("bold", True)
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+
+        elif etype == "abstract_body":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.first_line_indent = Inches(0)
+            _add_text_with_italics(p, element.get("text", ""))
+
+        elif etype == "keywords":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.line_spacing = 2.0
+            # Support both first_line_indent: true/720 and explicit values
+            fi = element.get("first_line_indent", True)
+            if fi is True or (isinstance(fi, (int, float)) and fi > 0):
+                p.paragraph_format.first_line_indent = Inches(0.5)
+            else:
+                p.paragraph_format.first_line_indent = Inches(0)
+            run = p.add_run(element.get("label", "Keywords: "))
+            run.italic = element.get("label_italic", True)
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+            # Support both field names: "items" (MD prompt) and "keywords" (legacy)
+            keywords = element.get("items", element.get("keywords", []))
+            if isinstance(keywords, list):
+                keywords_text = ", ".join(str(k) for k in keywords)
+            else:
+                keywords_text = str(keywords)
+            run2 = p.add_run(keywords_text)
+            run2.font.name = 'Times New Roman'
+            run2.font.size = Pt(12)
+
+
+def _write_body(doc, section_data, instructions):
+    """Write all body content (intro through discussion)."""
+    doc.add_section()
+    # Support both field names: body_first_line_indent_dxa (MD prompt) and body_first_line_indent (legacy)
+    indent_dxa = instructions.get("body_first_line_indent_dxa", instructions.get("body_first_line_indent", 720))
+    indent = Inches(indent_dxa / 1440) if indent_dxa > 13 else Inches(indent_dxa)
+
+    for element in section_data.get("elements", []):
+        etype = element.get("type", "")
+
+        if etype == "title_repeat":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.first_line_indent = Inches(0)
+            run = p.add_run(element.get("text", ""))
+            run.bold = element.get("bold", True)
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+
+        elif etype == "heading":
+            level = element.get("level", 1)
+            level = min(max(level, 1), 3)
+            p = doc.add_heading(element.get("text", ""), level=level)
+            for run in p.runs:
+                run.font.color.rgb = RGBColor(0, 0, 0)
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(12)
+
+        elif etype == "body_paragraph":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.first_line_indent = indent
+            _add_text_with_italics(p, element.get("text", ""))
+
+        elif etype == "figure_caption":
+            p = doc.add_paragraph()
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.first_line_indent = Inches(0)
+            label = element.get("label", f"Figure {element.get('number', '')}")
+            run = p.add_run(label)
+            run.bold = True
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+            caption = element.get("caption", "")
+            if caption:
+                p2 = doc.add_paragraph()
+                p2.paragraph_format.line_spacing = 2.0
+                p2.paragraph_format.first_line_indent = Inches(0)
+                run2 = p2.add_run(caption)
+                run2.italic = True
+                run2.font.name = 'Times New Roman'
+                run2.font.size = Pt(12)
+
+        elif etype == "table_caption":
+            p = doc.add_paragraph()
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.first_line_indent = Inches(0)
+            label = element.get("label", f"Table {element.get('number', '')}")
+            run = p.add_run(label)
+            run.bold = True
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+            caption = element.get("caption", "")
+            if caption:
+                p2 = doc.add_paragraph()
+                p2.paragraph_format.line_spacing = 2.0
+                p2.paragraph_format.first_line_indent = Inches(0)
+                run2 = p2.add_run(caption)
+                run2.italic = True
+                run2.font.name = 'Times New Roman'
+                run2.font.size = Pt(12)
+
+
+def _write_references_page(doc, section_data, instructions):
+    """Write the references page with hanging indent."""
+    doc.add_section()
+
+    for element in section_data.get("elements", []):
+        etype = element.get("type", "")
+
+        if etype == "references_label":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.first_line_indent = Inches(0)
+            run = p.add_run(element.get("text", "References"))
+            run.bold = element.get("bold", True)
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+
+        elif etype == "reference_entry":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.left_indent = Inches(0.5)
+            p.paragraph_format.first_line_indent = Inches(-0.5)
+            _add_text_with_italics(p, element.get("text", ""))
+
+
+def _add_text_with_italics(paragraph, text):
+    """Parse *italic* markers and create appropriate runs."""
+    if not text:
+        return
+    parts = re.split(r'(\*[^*]+\*)', text)
+    for part in parts:
+        if part.startswith('*') and part.endswith('*') and len(part) > 2:
+            run = paragraph.add_run(part[1:-1])
+            run.italic = True
+        else:
+            run = paragraph.add_run(part)
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(12)
+
+
+def _add_page_number_header(section):
+    """Add right-aligned page number to section header."""
+    header = section.header
+    header.is_linked_to_previous = False
+
+    if not header.paragraphs:
+        p = header.add_paragraph()
+    else:
+        p = header.paragraphs[0]
+
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+
+    run = p.add_run()
+    fldChar1 = OxmlElement('w:fldChar')
+    fldChar1.set(qn('w:fldCharType'), 'begin')
+    run._r.append(fldChar1)
+
+    run2 = p.add_run()
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = ' PAGE '
+    run2._r.append(instrText)
+
+    run3 = p.add_run()
+    fldChar2 = OxmlElement('w:fldChar')
+    fldChar2.set(qn('w:fldCharType'), 'end')
+    run3._r.append(fldChar2)
+
+    for run in p.runs:
+        run.font.name = 'Times New Roman'
+        run.font.size = Pt(12)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LEGACY GENERIC WRITER (for non-APA journals)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def write_formatted_docx(instructions: dict, output_path: str) -> str:
     """
     Write a formatted DOCX file from structured docx_instructions.
 
-    This function NEVER raises — if a specific instruction fails, it logs and
-    continues. It always produces a valid .docx file.
-
-    Args:
-        instructions: Dict produced by the transform agent containing:
-            - rules: journal rules dict
-            - sections: list of { type, content, level, bold, italic, centered, ... }
-        output_path: Absolute path where the DOCX should be saved.
-
-    Returns:
-        output_path on success.
+    Handles both:
+    - New APA format (sections with type=title_page/abstract_page/body/references_page)
+    - Legacy flat format (sections with type=title/heading/paragraph/reference)
     """
     if not instructions or not instructions.get("sections"):
         raise DocumentWriteError("docx_instructions must contain a non-empty 'sections' list.")
 
+    sections = instructions.get("sections", [])
+
+    # Detect if this is the new APA section-based format
+    section_types = {s.get("type") for s in sections if isinstance(s, dict)}
+    is_apa_format = bool(section_types & {"title_page", "abstract_page", "references_page"})
+
+    if is_apa_format:
+        return build_apa_docx(instructions, output_path)
+
+    # Legacy flat format
     doc = Document()
     rules = instructions.get("rules", {}) or {}
-    sections = instructions.get("sections", []) or []
 
     doc_rules = rules.get("document", {})
     font_name = doc_rules.get("font", "Times New Roman")
@@ -77,7 +477,6 @@ def write_formatted_docx(instructions: dict, output_path: str) -> str:
                 _add_paragraph(doc, content, font_name, font_size, line_spacing)
         except Exception as e:
             logger.warning("[DOCX] Failed to render section type=%s: %s", section_type, e)
-            # Fallback: add content as plain paragraph
             try:
                 _add_paragraph(doc, content, font_name, font_size, line_spacing)
             except Exception:
@@ -90,8 +489,11 @@ def write_formatted_docx(instructions: dict, output_path: str) -> str:
     return str(out)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LEGACY HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _apply_document_defaults(doc: Document, font_name: str, font_size: int, line_spacing: float) -> None:
-    """Set font, size, and line spacing on the Normal style for the entire document."""
     try:
         style = doc.styles["Normal"]
         style.font.name = font_name
@@ -103,7 +505,6 @@ def _apply_document_defaults(doc: Document, font_name: str, font_size: int, line
 
 
 def _set_document_margins(doc: Document, margins: dict) -> None:
-    """Apply margins to all document sections."""
     for section in doc.sections:
         try:
             top = _parse_measurement(margins.get("top", 1.0))
@@ -119,15 +520,6 @@ def _set_document_margins(doc: Document, margins: dict) -> None:
 
 
 def _parse_measurement(value) -> float:
-    """
-    Convert a measurement to inches (float).
-
-    Accepts:
-        "1in" → 1.0
-        "2.54cm" → 1.0
-        "72pt" → 1.0
-        1.0 → 1.0
-    """
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
@@ -150,7 +542,6 @@ def _parse_measurement(value) -> float:
 
 
 def _apply_line_spacing(pf, line_spacing: float) -> None:
-    """Apply WD_LINE_SPACING rule based on the float value."""
     if line_spacing == 1.0:
         pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
     elif line_spacing == 1.5:
@@ -170,15 +561,8 @@ def _apply_font(run, font_name: str, font_size: int, bold: bool = False, italic:
 
 
 def _apply_case_transform(text: str, case_rule: str) -> str:
-    """
-    Transform text case per journal rules.
-
-    Supports: "Title Case", "UPPERCASE", "Sentence case", "lowercase"
-    Handles acronyms (NLP, AI), hyphenated words, non-ASCII chars.
-    """
     if not case_rule or case_rule not in _CASE_OPTIONS:
         return text
-
     try:
         if case_rule == "UPPERCASE":
             return text.upper()
@@ -189,7 +573,6 @@ def _apply_case_transform(text: str, case_rule: str) -> str:
                 return text
             return text[0].upper() + text[1:].lower() if len(text) > 1 else text.upper()
         elif case_rule == "Title Case":
-            # Skip all-caps words (acronyms like NLP, AI) and hyphenated sub-words
             _SMALL_WORDS = {
                 "a", "an", "the", "and", "but", "or", "for", "nor",
                 "on", "at", "to", "by", "in", "of", "up", "as", "is",
@@ -197,7 +580,6 @@ def _apply_case_transform(text: str, case_rule: str) -> str:
             words = text.split()
             result = []
             for i, word in enumerate(words):
-                # Preserve already-uppercase acronyms (2+ uppercase letters)
                 if len(word) >= 2 and word.isupper():
                     result.append(word)
                 elif "-" in word:
@@ -210,8 +592,7 @@ def _apply_case_transform(text: str, case_rule: str) -> str:
                     result.append(word.lower())
             return " ".join(result)
     except Exception as e:
-        logger.warning("[DOCX] Case transform failed for '%s': %s — keeping original", case_rule, e)
-
+        logger.warning("[DOCX] Case transform failed for '%s': %s", case_rule, e)
     return text
 
 
@@ -226,7 +607,7 @@ def _add_title(doc: Document, text: str, font_name: str, font_size: int) -> None
     para = doc.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = para.add_run(text)
-    _apply_font(run, font_name, font_size + 2, bold=True)
+    _apply_font(run, font_name, font_size, bold=True)
 
 
 def _add_heading(doc: Document, text: str, level: int, heading_rules: dict, font_name: str, font_size: int) -> None:
@@ -236,24 +617,14 @@ def _add_heading(doc: Document, text: str, level: int, heading_rules: dict, font
     centered = heading_rules.get("centered", False)
     case = heading_rules.get("case", "Title Case")
     heading_font_size = _safe_int(heading_rules.get("font_size", font_size), font_size)
-
     text = _apply_case_transform(text, case)
-
     if centered:
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
     run = para.add_run(text)
     _apply_font(run, font_name, heading_font_size, bold=bold, italic=italic)
 
 
-def _add_abstract(
-    doc: Document,
-    text: str,
-    abstract_rules: dict,
-    font_name: str,
-    font_size: int,
-    line_spacing: float,
-) -> None:
+def _add_abstract(doc: Document, text: str, abstract_rules: dict, font_name: str, font_size: int, line_spacing: float) -> None:
     label = abstract_rules.get("label", "Abstract")
     label_bold = abstract_rules.get("label_bold", False)
     centered = abstract_rules.get("label_centered", True)
@@ -281,43 +652,6 @@ def _add_reference(doc: Document, text: str, ref_rules: dict, font_name: str, fo
     _apply_font(run, font_name, font_size)
 
 
-def _apply_heading_style(paragraph, fix: dict) -> None:
-    """Apply bold/italic/centered/case to an existing heading paragraph."""
-    bold = fix.get("bold", True)
-    italic = fix.get("italic", False)
-    centered = fix.get("centered", False)
-    case = fix.get("case", "Title Case")
-
-    text = paragraph.text
-    text = _apply_case_transform(text, case)
-
-    if centered:
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    for run in paragraph.runs:
-        run.bold = bold
-        run.italic = italic
-
-    # If text changed (case transform), rewrite the first run
-    if text != paragraph.text and paragraph.runs:
-        paragraph.runs[0].text = text
-        for run in paragraph.runs[1:]:
-            run.text = ""
-
-
-def _apply_reference_formatting(doc: Document, reference_order: list, font_name: str, font_size: int) -> None:
-    """Add a references section with hanging indent from the given list."""
-    if not reference_order:
-        return
-    for ref_text in reference_order:
-        para = doc.add_paragraph()
-        para.paragraph_format.left_indent = Inches(0.5)
-        para.paragraph_format.first_line_indent = Inches(-0.5)
-        run = para.add_run(ref_text)
-        run.font.name = font_name
-        run.font.size = Pt(font_size)
-
-
 def _add_figure_caption(doc: Document, text: str, fig_rules: dict, font_name: str, font_size: int) -> None:
     para = doc.add_paragraph()
     bold = fig_rules.get("label_bold", True)
@@ -333,38 +667,35 @@ def _add_table_caption(doc: Document, text: str, tbl_rules: dict, font_name: str
     _apply_font(run, font_name, font_size - 1, bold=bold)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# IN-PLACE DOCX TRANSFORMATION (for uploaded DOCX files)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _apply_heading_style(paragraph, fix: dict) -> None:
+    bold = fix.get("bold", True)
+    italic = fix.get("italic", False)
+    centered = fix.get("centered", False)
+    case = fix.get("case", "Title Case")
+    text = paragraph.text
+    text = _apply_case_transform(text, case)
+    if centered:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in paragraph.runs:
+        run.bold = bold
+        run.italic = italic
+    if text != paragraph.text and paragraph.runs:
+        paragraph.runs[0].text = text
+        for run in paragraph.runs[1:]:
+            run.text = ""
+
+
 def transform_docx_in_place(
     source_docx_path: str,
     transform_data: dict,
     rules: dict,
     output_path: str,
 ) -> str:
-    """
-    Apply journal formatting transformations to a source DOCX in-place.
-
-    Unlike write_formatted_docx() which rebuilds the document from extracted
-    text, this function opens the original DOCX and applies ONLY the required
-    formatting changes. All figures (InlineShape), tables (XML), equations
-    (OMML), and embedded objects are preserved untouched.
-
-    Transformations applied:
-      Pass 1 — Normal style: font family, font size, line spacing
-      Pass 2 — Page margins: top / bottom / left / right (all sections)
-      Pass 3 — Headings: case, bold, italic, centered, font size
-      Pass 4 — Reference reordering: alphabetical or per transform_data order
-
-    Args:
-        source_docx_path: Path to the original uploaded DOCX.
-        transform_data: Dict from the transform agent (provides reference_order).
-        rules: Journal rules dict (source of truth for all formatting values).
-        output_path: Absolute path where the transformed DOCX should be saved.
-
-    Returns:
-        output_path on success.
-
-    Raises:
-        DocumentWriteError: If the source DOCX cannot be opened or saved.
-    """
+    """Apply journal formatting transformations to a source DOCX in-place."""
     try:
         doc = Document(source_docx_path)
     except Exception as e:
@@ -379,18 +710,14 @@ def transform_docx_in_place(
     line_spacing_v  = _safe_float(doc_rules.get("line_spacing", 2.0), 2.0)
     margins         = doc_rules.get("margins", {})
 
-    # ── Pass 1: Normal style — font + line spacing ────────────────────────
     try:
         normal = doc.styles["Normal"]
         normal.font.name = font_name
         normal.font.size = Pt(font_size_pt)
         _apply_line_spacing(normal.paragraph_format, line_spacing_v)
-        logger.debug("[DOCX_INPLACE] Normal style set — font=%s size=%dpt spacing=%.1f",
-                     font_name, font_size_pt, line_spacing_v)
     except Exception as e:
         logger.warning("[DOCX_INPLACE] Could not set Normal style: %s", e)
 
-    # ── Pass 2: Page margins ──────────────────────────────────────────────
     for sec in doc.sections:
         try:
             sec.top_margin    = Inches(_parse_measurement(margins.get("top",    1.0)))
@@ -400,7 +727,6 @@ def transform_docx_in_place(
         except Exception as e:
             logger.warning("[DOCX_INPLACE] Could not set margins: %s", e)
 
-    # ── Pass 3: Headings ──────────────────────────────────────────────────
     for para in doc.paragraphs:
         if not para.style.name.startswith("Heading"):
             continue
@@ -433,7 +759,6 @@ def transform_docx_in_place(
             except Exception as e:
                 logger.warning("[DOCX_INPLACE] Heading run format error: %s", e)
 
-    # ── Pass 4: Reference reordering ──────────────────────────────────────
     reference_order = transform_data.get("reference_order", [])
     _reorder_references_in_place(doc, reference_order, ref_rules)
 
@@ -449,11 +774,6 @@ def transform_docx_in_place(
 
 
 def _replace_paragraph_text_preserve_runs(para, new_text: str) -> None:
-    """
-    Replace the full text of a paragraph while preserving the first run's
-    character formatting (bold, italic, font, size). All subsequent runs are
-    cleared so the paragraph contains exactly one run with the new text.
-    """
     if not para.runs:
         para.text = new_text
         return
@@ -463,22 +783,7 @@ def _replace_paragraph_text_preserve_runs(para, new_text: str) -> None:
 
 
 def _reorder_references_in_place(doc: Document, reference_order: list, ref_rules: dict) -> None:
-    """
-    Reorder reference-list paragraphs in the document body.
-
-    Strategy:
-      1. Locate the "References" heading paragraph.
-      2. Collect non-empty body paragraphs after it (stopping at the next heading).
-      3. If transform_data provided a reference_order list of the same length,
-         use that ordering. Otherwise sort alphabetically (APA/Chicago).
-      4. Update each paragraph's text in-place, preserving run formatting.
-
-    If the counts don't match (LLM may have added/removed refs), falls back to
-    using the first N ordered items to patch existing paragraphs.
-    """
     paragraphs = doc.paragraphs
-
-    # Find the references heading
     ref_start_idx: Optional[int] = None
     for i, para in enumerate(paragraphs):
         if re.search(r"^\s*references?\s*$", para.text, re.IGNORECASE):
@@ -486,10 +791,8 @@ def _reorder_references_in_place(doc: Document, reference_order: list, ref_rules
             break
 
     if ref_start_idx is None:
-        logger.debug("[DOCX_INPLACE] No references heading found — skipping reorder")
         return
 
-    # Collect body paragraphs in the references section
     ref_paras = []
     for para in paragraphs[ref_start_idx + 1:]:
         if para.style.name.startswith("Heading"):
@@ -498,22 +801,17 @@ def _reorder_references_in_place(doc: Document, reference_order: list, ref_rules
             ref_paras.append(para)
 
     if not ref_paras:
-        logger.debug("[DOCX_INPLACE] References section empty — nothing to reorder")
         return
 
-    # Determine ordered texts
     if reference_order and len(reference_order) == len(ref_paras):
         ordered = reference_order
     else:
-        # Default: alphabetical (APA, Chicago) — numbered styles (IEEE, Vancouver)
-        # should not be sorted, but the transform agent will pass a correct list
         ordering = ref_rules.get("ordering", "alphabetical")
         if ordering == "alphabetical":
             ordered = sorted([p.text for p in ref_paras], key=str.lower)
         else:
-            ordered = [p.text for p in ref_paras]  # keep original order
+            ordered = [p.text for p in ref_paras]
 
-    # Apply in-place — update text of each paragraph
     for para, new_text in zip(ref_paras, ordered):
         if para.text != new_text:
             _replace_paragraph_text_preserve_runs(para, new_text)
@@ -533,37 +831,3 @@ def _safe_float(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-if __name__ == "__main__":
-    import os as _os, sys as _sys
-    _sys.path.insert(0, str(Path(__file__).parent.parent))
-    from tools.rule_loader import load_rules as _load_rules
-
-    rules = _load_rules("APA 7th Edition")
-    instructions = {
-        "rules": rules,
-        "sections": [
-            {"type": "title", "content": "machine learning in healthcare"},
-            {"type": "abstract", "content": "This paper presents a novel approach to ML in clinical settings."},
-            {"type": "heading", "content": "introduction", "level": 1},
-            {"type": "paragraph", "content": "We study the effect of deep learning on radiology outcomes."},
-            {"type": "reference", "content": "Smith, J. A. (2020). Article title. Journal, 10(2), 100-110."},
-        ],
-    }
-
-    path = write_formatted_docx(instructions, "tests/output_test.docx")
-    assert _os.path.exists(path), "Output file not created!"
-    print(f"OK docx_writer: created {path}")
-
-    # Test case transform
-    assert _apply_case_transform("machine learning in NLP", "Title Case") == "Machine Learning in NLP"
-    assert _apply_case_transform("hello world", "UPPERCASE") == "HELLO WORLD"
-    assert _apply_case_transform("HELLO WORLD", "Sentence case") == "Hello world"
-    print("OK docx_writer: case transforms correct")
-
-    # Test measurement parsing
-    assert _parse_measurement("1in") == 1.0
-    assert abs(_parse_measurement("2.54cm") - 1.0) < 0.01
-    assert _parse_measurement(1.5) == 1.5
-    print("OK docx_writer: measurement parsing correct")

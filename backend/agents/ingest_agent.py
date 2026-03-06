@@ -3,6 +3,8 @@ Agent 1: INGEST — Label and structure raw research paper text.
 
 Receives raw extracted text from PDF/DOCX and annotates every content block
 with structural markers. Downstream agents depend entirely on these labels.
+
+Labels match APA_Pipeline_Complete_Prompts.md exactly.
 """
 import re
 import time
@@ -11,161 +13,185 @@ from typing import Any
 from crewai import Agent
 
 from tools.logger import get_logger
-from tools.tool_errors import LLMResponseError, ParseError  # noqa: F401 — available for callers
+from tools.tool_errors import LLMResponseError, ParseError  # noqa: F401
 
 logger = get_logger(__name__)
 
-# Labels used by this agent — must match STEP4 spec exactly
+# Labels used by this agent — matches APA Pipeline spec
 STRUCTURAL_LABELS = [
-    "[TITLE]",
-    "[AUTHORS]",
-    "[ABSTRACT_START]",
-    "[ABSTRACT_END]",
-    "[KEYWORDS]",
+    "[TITLE_START]", "[TITLE_END]",
+    "[AUTHORS_START]", "[AUTHORS_END]",
+    "[ABSTRACT_START]", "[ABSTRACT_END]",
+    "[KEYWORDS_START]", "[KEYWORDS_END]",
+    "[SIGNIFICANCE_START]", "[SIGNIFICANCE_END]",
     "[HEADING_H1:<text>]",
     "[HEADING_H2:<text>]",
     "[HEADING_H3:<text>]",
-    "[FIGURE_CAPTION:<text>]",
-    "[TABLE_CAPTION:<text>]",
-    "[REFERENCE_START]",
-    "[REFERENCE_END]",
+    "[FIGURE_CAPTION_START:<N>]", "[FIGURE_CAPTION_END:<N>]",
+    "[TABLE_CAPTION_START:<N>]", "[TABLE_CAPTION_END:<N>]",
+    "[REFERENCE_START]", "[REFERENCE_END]",
     "[CITATION:<text>]",
+    "[METADATA_START]", "[METADATA_END]",
+    "[ACKNOWLEDGMENTS_START]", "[ACKNOWLEDGMENTS_END]",
+    "[AUTHOR_CONTRIBUTIONS_START]", "[AUTHOR_CONTRIBUTIONS_END]",
+    "[CITATION_STYLE:<style>]",
+    "[SOURCE_FORMAT:<format>]",
 ]
 
-# Compiled pattern for validating ingest output (Improvement 3)
+# Compiled pattern for validating ingest output
 _LABEL_PATTERN = re.compile(
-    r"\[(?:TITLE|AUTHORS|ABSTRACT_START|ABSTRACT_END|KEYWORDS"
-    r"|HEADING_H[123]:[^\]]+|FIGURE_CAPTION:[^\]]+|TABLE_CAPTION:[^\]]+"
-    r"|REFERENCE_START|REFERENCE_END|CITATION:[^\]]+)\]"
+    r"\[(?:TITLE_START|TITLE_END|AUTHORS_START|AUTHORS_END"
+    r"|ABSTRACT_START|ABSTRACT_END|KEYWORDS_START|KEYWORDS_END"
+    r"|SIGNIFICANCE_START|SIGNIFICANCE_END"
+    r"|HEADING_H[123]:[^\]]+|FIGURE_CAPTION_(?:START|END):[^\]]+"
+    r"|TABLE_CAPTION_(?:START|END):[^\]]+"
+    r"|REFERENCE_START|REFERENCE_END|CITATION:[^\]]+"
+    r"|METADATA_START|METADATA_END"
+    r"|ACKNOWLEDGMENTS_START|ACKNOWLEDGMENTS_END"
+    r"|AUTHOR_CONTRIBUTIONS_START|AUTHOR_CONTRIBUTIONS_END"
+    r"|CITATION_STYLE:[^\]]+|SOURCE_FORMAT:[^\]]+)\]"
 )
 
 
 def _validate_ingest_output(labelled_text: str) -> None:
-    """
-    Validate that ingest output contains at least one structural label.
-
-    Raises:
-        LLMResponseError: If no structural labels are found.
-    """
+    """Validate that ingest output contains at least one structural label."""
     matches = _LABEL_PATTERN.findall(labelled_text)
     if not matches:
         raise LLMResponseError(
             "Ingest output contains no structural labels. "
-            "Expected at least one of: [TITLE], [AUTHORS], [HEADING_H1:...], etc."
+            "Expected at least one of: [TITLE_START], [ABSTRACT_START], [HEADING_H1:...], etc."
         )
     logger.info("[INGEST] Output validated — %d structural labels detected", len(matches))
 
 
 def _safe_context(context: dict, key: str) -> Any:
-    """
-    Defensively access a required key from a pipeline context dict.
-
-    Args:
-        context: Pipeline context dictionary.
-        key: Required key name.
-
-    Returns:
-        Value at context[key].
-
-    Raises:
-        ValueError: If key is absent.
-    """
     if key not in context:
         raise ValueError(f"Pipeline context missing required key: '{key}'")
     return context[key]
+
+
+# ── System prompt from APA_Pipeline_Complete_Prompts.md §2 ──────────────────
+INGEST_SYSTEM_PROMPT = """You are a scientific paper structure labeler. Your ONLY job is to read raw academic paper text and add structural labels. You must NOT change, rewrite, rephrase, summarize, or delete ANY text.
+
+## YOUR TASK
+
+Read the paper text and insert structural marker labels at the correct positions. Return the ENTIRE paper text with labels inserted.
+
+## STRUCTURAL LABELS TO INSERT
+
+You must identify and label ALL of the following elements using these exact markers:
+
+[TITLE_START]...[TITLE_END]
+  - The main title of the paper. Usually the first major text block.
+  - Join multi-line titles into a single line between the markers.
+
+[AUTHORS_START]...[AUTHORS_END]
+  - Author names and affiliations block. Includes superscript affiliation markers.
+  - Include institution names and addresses within this block.
+
+[ABSTRACT_START]...[ABSTRACT_END]
+  - The abstract paragraph. May or may not have an explicit "Abstract" label.
+  - Look for: a summary paragraph before the Introduction, often after author info.
+  - Significance statements are NOT part of the abstract — label them separately.
+
+[KEYWORDS_START]...[KEYWORDS_END]
+  - Keywords line. May use | or , or ; as separators.
+
+[SIGNIFICANCE_START]...[SIGNIFICANCE_END]
+  - "Significance" section if present (common in PNAS papers).
+
+[HEADING_H1:Exact Heading Text]
+  - Major section headings: Introduction, Results, Discussion, Methods, Materials and Methods, Conclusion, Acknowledgments.
+  - These are Level 1 headings (centered, bold in APA).
+
+[HEADING_H2:Exact Heading Text]
+  - Subsection headings within a major section.
+  - Often italicized or bold in the source.
+
+[HEADING_H3:Exact Heading Text]
+  - Sub-subsection headings (rare). Usually run-in with the paragraph text.
+
+[FIGURE_CAPTION_START:N]...[FIGURE_CAPTION_END:N]
+  - Figure caption text. N = figure number (1, 2, 3...).
+  - Starts with "Fig. N." or "Figure N." in the source text.
+
+[TABLE_CAPTION_START:N]...[TABLE_CAPTION_END:N]
+  - Table caption text. N = table number.
+
+[REFERENCE_START]...[REFERENCE_END]
+  - The entire references / bibliography section.
+  - Each individual reference entry should be preserved exactly as-is within this block.
+
+[CITATION:original_text]
+  - In-text citations. Mark EVERY citation occurrence.
+  - Numbered: (1), (2, 3), (1-5), superscript numbers, [1], [2-4]
+  - Author-date: (Smith, 2020), (Smith & Jones, 2020), (Smith et al., 2020)
+
+[METADATA_START]...[METADATA_END]
+  - Journal metadata: DOI, received/accepted dates, editor info, page numbers.
+
+[ACKNOWLEDGMENTS_START]...[ACKNOWLEDGMENTS_END]
+  - Acknowledgments section.
+
+[AUTHOR_CONTRIBUTIONS_START]...[AUTHOR_CONTRIBUTIONS_END]
+  - "Author contributions:" block if present.
+
+## CRITICAL RULES
+
+1. NEVER modify any text content. Only INSERT labels around existing text.
+2. Every label that is opened MUST be closed.
+3. If a heading appears to span what would be H1 and H2, use H2 for the more specific sub-topic.
+4. Detect the citation STYLE used in the paper:
+   - If references are numbered (1, 2, 3...) and citations use numbers → [CITATION_STYLE:numbered]
+   - If citations use (Author, Year) → [CITATION_STYLE:author-date]
+   Insert this once at the top of your output.
+5. If the paper is from a journal (PNAS, Nature, Cell, etc.), note the source style:
+   [SOURCE_FORMAT:NLM] or [SOURCE_FORMAT:APA] or [SOURCE_FORMAT:other]
+6. Papers from PNAS, Nature, Science, Cell use NLM/Vancouver numbered style — this is NOT APA and must be converted.
+
+## PARAGRAPH MERGING RULE
+
+If the input has hard line breaks in the middle of sentences (common from PDF extraction):
+- Lines ending without period AND next line starts lowercase → these are ONE paragraph
+- Merge them into a single continuous paragraph between labels
+- Hyphenated line breaks like "entero-\\nhemorrhagic" → merge to "enterohemorrhagic"
+
+## OUTPUT FORMAT
+
+Return the complete paper text with all labels inserted. Start with:
+[CITATION_STYLE:numbered|author-date]
+[SOURCE_FORMAT:NLM|APA|other]
+
+Then the labeled paper text."""
 
 
 def create_ingest_agent(llm: Any) -> Agent:
     """
     Agent 1: INGEST — Label raw paper text with structural markers.
 
-    Receives raw paper_content and produces labelled_text that the Parse agent
-    uses to extract the full paper_structure JSON. This agent ONLY adds labels —
-    it never interprets formatting rules, modifies content, or scores compliance.
-
-    Labelling rules (13 structural markers):
-      [TITLE]          → First prominent short line (< 200 chars), before authors
-      [AUTHORS]        → Name/affiliation lines immediately after title
-      [ABSTRACT_START] → Beginning of abstract block
-      [ABSTRACT_END]   → End of abstract block
-      [KEYWORDS]       → Line starting with Keywords/Key words/Index Terms
-      [HEADING_H1:x]   → Major sections (Introduction, Methods, Results, etc.)
-      [HEADING_H2:x]   → Subsections (1.1, 2.3, or indented short lines)
-      [HEADING_H3:x]   → Sub-subsections (1.1.1)
-      [FIGURE_CAPTION] → Lines starting with Figure/Fig/FIGURE + number
-      [TABLE_CAPTION]  → Lines starting with Table/TABLE + number
-      [REFERENCE_START]→ Start of References/Bibliography section
-      [REFERENCE_END]  → End of document
-      [CITATION:x]     → Inline citations: (Author, Year), [1], [1-3]
-
-    Edge cases:
-      - paper_content < 100 chars → raises ParseError
-      - paper_content > 50,000 chars → truncates: first 40,000 + last 5,000
-
-    Args:
-        llm: Shared LLM string (e.g., "gemini/gemini-2.0-flash") at temperature=0.
-
-    Returns:
-        CrewAI Agent configured for structural labelling.
+    Uses comprehensive structural labels from APA Pipeline spec.
     """
     logger.info("[INGEST] Agent created")
 
     return Agent(
-        role="Academic Document Structure Analyst",
-        goal=(
-            "Read raw research paper text and annotate EVERY content block with "
-            "its structural role using exactly these 13 label types:\n"
-            "  [TITLE]          — First prominent short line before author names\n"
-            "  [AUTHORS]        — Author name/affiliation block after title\n"
-            "  [ABSTRACT_START] — Opening marker of abstract section\n"
-            "  [ABSTRACT_END]   — Closing marker of abstract section\n"
-            "  [KEYWORDS]       — Line starting with Keywords/Key words/Index Terms\n"
-            "  [HEADING_H1:text]— Major section headings (Introduction, Methods, etc.)\n"
-            "  [HEADING_H2:text]— Subsection headings (1.1, 2.3, or indented short lines)\n"
-            "  [HEADING_H3:text]— Sub-subsection headings (1.1.1)\n"
-            "  [FIGURE_CAPTION:text] — Caption lines starting with Figure/Fig + number\n"
-            "  [TABLE_CAPTION:text]  — Caption lines starting with Table + number\n"
-            "  [REFERENCE_START]— Opening marker of References/Bibliography section\n"
-            "  [REFERENCE_END]  — Closing marker at end of references\n"
-            "  [CITATION:text]  — Inline citations: (Author, Year), [1], [1,2], [1-3]\n\n"
-            "LABELLING RULES (non-negotiable):\n"
-            "  1. Each label appears on its OWN LINE immediately before the content it marks\n"
-            "  2. Preserve ALL original text verbatim — never delete, reorder, or paraphrase\n"
-            "  3. Only add labels you are confident about — skip ambiguous content\n"
-            "  4. [HEADING_H1] for: Introduction, Methodology/Methods, Results/Findings, "
-            "     Discussion, Conclusion, Acknowledgements, Appendix — and numbered equivalents\n"
-            "  5. [HEADING_H2] for: numbered subsections (1.1, 2.3) or short indented lines\n"
-            "  6. [HEADING_H3] for: numbered sub-subsections (1.1.1) only\n"
-            "  7. [CITATION] inline within paragraph text — keep citation inline, "
-            "     add [CITATION:text] immediately before the citation marker\n"
-            "  8. If paper_content exceeds 50,000 chars: process first 40,000 chars + "
-            "     last 5,000 chars, insert [TRUNCATED] marker between them\n"
-            "  9. Non-English papers: attempt labelling using section names in that language\n"
-            " 10. Return ONLY the labelled text — no JSON, no explanation, no commentary\n\n"
-            "TOKEN SAFETY: If input is very large, focus on Title, Authors, Abstract, "
-            "first 3 sections, Figures, Tables, and References — these carry the most "
-            "structural information for downstream agents.\n\n"
-            "VALIDATION: Your output MUST contain at least one structural label. "
-            "If you produce output with no labels at all, the pipeline will reject it "
-            "and retry. Ensure every response has at minimum [TITLE] and [ABSTRACT_START]."
-        ),
+        role="Scientific Paper Structure Labeler",
+        goal=INGEST_SYSTEM_PROMPT,
         backstory=(
             "You are an expert academic document parser with 15 years of experience "
-            "processing research manuscripts across all disciplines — biomedical sciences, "
-            "engineering, physics, social sciences, and humanities. You have labelled over "
+            "processing research manuscripts across all disciplines. You have labelled over "
             "50,000 papers using structural annotation systems for major publishers including "
-            "Elsevier, Springer, IEEE, Nature, and PLoS. "
+            "Elsevier, Springer, IEEE, Nature, PNAS, and PLoS. "
             "Your labels are precise and conservative: you annotate what you are certain about "
             "and leave ambiguous content unlabelled rather than guess incorrectly. "
             "You never alter a single word of the original text — your job is to add structural "
             "markers that guide the downstream Parse agent in extracting the paper's metadata. "
-            "Wrong labels produce wrong structure, which causes incorrect formatting — your "
-            "accuracy directly determines the quality of the final formatted manuscript. "
-            "When input is very large, you prioritize labelling the structural skeleton "
-            "(title, abstract, headings, references) over exhaustive body paragraph coverage."
+            "You detect citation styles (numbered vs author-date) and source formats (NLM vs APA) "
+            "automatically. You recognize that PNAS, Nature, Science, Cell papers use NLM/Vancouver "
+            "numbered citations which must be flagged for downstream conversion to APA author-date format."
         ),
         llm=llm,
         allow_delegation=False,
         verbose=True,
         max_iter=3,
+        max_tokens=16384,
     )

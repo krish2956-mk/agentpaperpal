@@ -20,7 +20,7 @@ from agents import (
 )
 from agents.validate_agent import SECTION_WEIGHTS
 from tools.compliance_checker import apply_deterministic_checks, run_deterministic_checks
-from tools.docx_writer import transform_docx_in_place, write_formatted_docx
+from tools.docx_writer import build_apa_docx, transform_docx_in_place, write_formatted_docx
 from tools.logger import get_logger
 from tools.rule_loader import load_rules
 from tools.tool_errors import (
@@ -32,7 +32,67 @@ from tools.tool_errors import (
 )
 
 load_dotenv(override=True)
+
+# Override litellm default max_tokens (4096) — far too low for our pipeline.
+# The TRANSFORM agent outputs full paper content as structured JSON which
+# easily exceeds 4096 tokens. Gemini 2.5 Flash supports up to 65535 output tokens.
+import litellm
+litellm.max_tokens = 16384
+
 logger = get_logger(__name__)
+
+
+def merge_broken_lines(raw_text: str) -> str:
+    """
+    PDF-extracted text has hard line breaks mid-sentence.
+    This merges them into proper paragraphs BEFORE the LLM sees the text.
+
+    Rules:
+    - If a line ends WITHOUT sentence-ending punctuation (. ? ! :)
+      AND the next line starts with a lowercase letter or continues a word,
+      merge them with a space.
+    - If a line ends with a hyphen (word break like "entero-\\nhemorrhagic"),
+      merge WITHOUT space and remove hyphen.
+    - Preserve blank lines as paragraph breaks.
+    - Preserve lines that start numbered references (e.g., "1. Author...")
+    """
+    lines = raw_text.split('\n')
+    merged = []
+    buffer = ""
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Blank line = paragraph break
+        if not stripped:
+            if buffer:
+                merged.append(buffer)
+                buffer = ""
+            merged.append("")
+            continue
+
+        # If buffer is empty, start new buffer
+        if not buffer:
+            buffer = stripped
+            continue
+
+        # Check if previous buffer line ends with hyphenated word break
+        if buffer.endswith('-') and stripped and stripped[0].islower():
+            buffer = buffer[:-1] + stripped  # merge without space, remove hyphen
+        # Check if this looks like a continuation (no sentence-end + lowercase start)
+        elif (buffer and
+              buffer[-1] not in '.?!:' and
+              stripped and
+              (stripped[0].islower() or stripped[0] in '(,;')):
+            buffer = buffer + " " + stripped
+        else:
+            merged.append(buffer)
+            buffer = stripped
+
+    if buffer:
+        merged.append(buffer)
+
+    return '\n'.join(merged)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -447,40 +507,57 @@ def _build_section_rules_guide(rules: dict, section_stats: dict) -> str:
 
 def _extract_first_json_block(text: str) -> str | None:
     """
-    Balanced-bracket extraction of the first complete JSON object or array.
+    Balanced-bracket extraction of the LARGEST complete JSON object from text.
 
-    Instead of a greedy regex that can match the wrong closing bracket,
-    this tracks bracket depth character-by-character, correctly handling
-    nested objects and quoted strings.
+    LLMs (especially Gemini 2.5 Flash with thinking) often output reasoning
+    text containing small JSON snippets BEFORE the actual large JSON output.
+    This function finds ALL complete JSON blocks and returns the largest one,
+    which is almost always the intended output.
 
     Returns the JSON substring on success, None if no valid block found.
     """
+    blocks = []
     for open_ch, close_ch in [('{', '}'), ('[', ']')]:
-        start = text.find(open_ch)
-        if start == -1:
-            continue
-        depth = 0
-        in_string = False
-        escape_next = False
-        for i, ch in enumerate(text[start:], start=start):
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == '\\' and in_string:
-                escape_next = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == open_ch:
-                depth += 1
-            elif ch == close_ch:
-                depth -= 1
-                if depth == 0:
-                    return text[start:i + 1]
-    return None
+        search_start = 0
+        while search_start < len(text):
+            start = text.find(open_ch, search_start)
+            if start == -1:
+                break
+            depth = 0
+            in_string = False
+            escape_next = False
+            found_end = -1
+            for i, ch in enumerate(text[start:], start=start):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == '\\' and in_string:
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        found_end = i
+                        break
+            if found_end > start:
+                block = text[start:found_end + 1]
+                blocks.append(block)
+                search_start = found_end + 1
+            else:
+                search_start = start + 1
+
+    if not blocks:
+        return None
+
+    # Return the largest block — the actual output, not reasoning snippets
+    return max(blocks, key=len)
 
 
 def extract_json_from_llm(raw: str) -> dict:
@@ -506,12 +583,14 @@ def extract_json_from_llm(raw: str) -> dict:
 
     text = raw.strip()
 
-    # Improvement 2: LLM output size guard — disabled (may truncate valid large outputs)
-    # MAX_LLM_RESPONSE = 200_000
-    # if len(raw) > MAX_LLM_RESPONSE:
-    #     raise LLMResponseError(
-    #         f"LLM response exceeds safe size ({len(raw):,} chars > {MAX_LLM_RESPONSE:,})"
-    #     )
+    # Step 0: Strip Gemini thinking prefix and CrewAI markers
+    # Gemini 2.5 Flash outputs "Thought: ..." before the actual answer.
+    # CrewAI wraps with "Final Answer: ..." marker.
+    if text.startswith("Thought:"):
+        # Find "Final Answer:" marker — everything after it is the actual output
+        fa_match = re.search(r"Final Answer:\s*", text)
+        if fa_match:
+            text = text[fa_match.end():].strip()
 
     # Step 1: Remove markdown code fences (```json...```, ```...```, ~~~...~~~)
     text = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
@@ -666,6 +745,10 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
     rules = load_rules(journal_style)
     logger.info("[PIPELINE] Rules loaded — %d sections", len(rules))
 
+    # ── Pre-pipeline: merge broken PDF lines ─────────────────────────────────
+    paper_content = merge_broken_lines(paper_content)
+    logger.info("[PIPELINE] Broken lines merged — %d chars after merge", len(paper_content))
+
     # ── Section-aware context building ───────────────────────────────────────
     # Pre-label the paper with IMRAD section delimiters (no truncation — only adds structure).
     # This gives INGEST a structurally clear document, dramatically improving
@@ -677,45 +760,47 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         len(section_stats), list(section_stats.keys()),
     )
 
-    logger.info("[PIPELINE] Initialising 4 agents (interpret merged into transform)...")
+    is_apa = "apa" in journal_style.lower()
+    logger.info("[PIPELINE] Initialising 4 agents — journal=%s is_apa=%s", journal_style, is_apa)
     ingest_agent = create_ingest_agent(llm)
     parse_agent = create_parse_agent(llm)
-    transform_agent = create_transform_agent(llm)
-    validate_agent = create_validate_agent(llm)
+    transform_agent = create_transform_agent(llm, journal_style=journal_style)
+    validate_agent = create_validate_agent(llm, journal_style=journal_style)
     logger.info("[PIPELINE] Agents ready")
 
     ingest_task = Task(
         description=(
-            f"You have received the text of a research paper. "
-            f"The paper has been pre-segmented by section (look for [SECTION: NAME] markers). "
-            f"Label every content block within each section with its type marker "
-            f"(TITLE, ABSTRACT, KEYWORD, HEADING_H1, HEADING_H2, HEADING_H3, "
-            f"BODY_PARAGRAPH, IN_TEXT_CITATION, FIGURE_CAPTION, TABLE_CAPTION, "
-            f"REFERENCE_ENTRY). Preserve the section markers — they guide the downstream agents.\n\n"
-            f"--- PAPER CONTENT (pre-segmented by section) ---\n{structured_paper}"
+            f"Label the following paper with structural markers. Follow ALL rules exactly.\n\n"
+            f"<paper>\n{structured_paper}\n</paper>"
         ),
         expected_output=(
-            "Labelled document content with each block prefixed by its type marker. "
-            "Example: [TITLE] Machine Learning in Healthcare\n[ABSTRACT] This paper..."
+            "The complete paper text with all structural labels inserted. "
+            "Must start with [CITATION_STYLE:...] and [SOURCE_FORMAT:...] lines. "
+            "Then the full paper text with [TITLE_START]...[TITLE_END], "
+            "[AUTHORS_START]...[AUTHORS_END], [ABSTRACT_START]...[ABSTRACT_END], "
+            "[HEADING_H1:text], [HEADING_H2:text], [CITATION:text], "
+            "[REFERENCE_START]...[REFERENCE_END] labels inserted."
         ),
         agent=ingest_agent,
     )
 
     parse_task = Task(
         description=(
-            "Parse the labelled document content from the previous step and extract "
-            "the complete paper structure. "
-            "Return ONLY valid JSON matching the paper_structure schema with keys: "
-            "title, authors, abstract (text + word_count), keywords, "
-            "imrad (introduction/methods/results/discussion booleans), "
-            "sections (list of heading/level/content_preview/in_text_citations), "
-            "figures (list of id/caption), tables (list of id/caption), "
-            "references (list of full reference strings). "
+            "Parse this labeled paper into structured JSON:\n\n"
+            "<labeled_paper>\n"
+            "The labeled paper text from the previous INGEST step.\n"
+            "</labeled_paper>\n\n"
+            "Extract ALL elements: metadata (citation_style, source_format, paper_type), "
+            "title, authors (with affiliations), abstract (text + word_count), keywords, "
+            "sections (with heading, level, content, subsections), figures, tables, "
+            "citations (with id, original_text, context), "
+            "references (with id, original_text, parsed components: authors, year, title, journal, volume, issue, pages, doi). "
             "Return ONLY valid JSON — no markdown fences, no explanation."
         ),
         expected_output=(
-            "Valid JSON object matching the paper_structure schema. "
-            "Must be parseable by json.loads() without any post-processing."
+            "Valid JSON object with keys: metadata, title, authors, affiliations, abstract, "
+            "keywords, sections, figures, tables, citations, references. "
+            "Each reference must be parsed into component parts (authors, year, title, journal, etc.)."
         ),
         agent=parse_agent,
         context=[ingest_task],
@@ -729,63 +814,82 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         ) or "   (no sections detected — paper may lack standard headers)\n"
     )
 
+    # ── Build transform task description — APA-specific vs generic ──────────
+    _transform_common_prefix = (
+        f"Transform this parsed paper to {journal_style} format. "
+        f"Apply ALL formatting rules. Convert ALL citations and references.\n\n"
+        f"<parsed_paper>\n"
+        f"The parsed paper JSON from the previous PARSE step.\n"
+        f"</parsed_paper>\n\n"
+        f"<journal_rules>\n{json.dumps(rules, indent=2)}\n</journal_rules>\n\n"
+        f"<formatting_guide>\n{section_rules_guide}\n</formatting_guide>\n\n"
+        f"Pre-computed section word counts:\n{_section_stats_text}\n\n"
+    )
+
+    if is_apa:
+        _transform_specifics = (
+            f"CRITICAL REQUIREMENTS FOR APA 7th Edition:\n"
+            f"1. Convert ALL numbered citations (1), [1], superscript¹ → (Author, Year) format\n"
+            f"   Map each numbered citation to its reference entry. Use & in parenthetical, 'and' in narrative.\n"
+            f"   3+ authors → first author et al. (with period after 'al')\n"
+            f"2. Convert ALL references from NLM/Vancouver to APA format:\n"
+            f"   - Author, F. M. (Year). Title. *Journal*, *Vol*(Issue), pages–pages.\n"
+            f"   - Alphabetical order by first author surname\n"
+            f"   - Hanging indent on all reference entries\n"
+            f"   - Use *asterisks* for italic (journal names, volume numbers)\n"
+            f"   - Use en-dash (–) for page ranges, not hyphen\n"
+            f"3. STRIP all source journal metadata (page numbers, journal headers, footer URLs)\n"
+            f"4. Generate docx_instructions with format_id='apa7' and these exact field names:\n"
+            f"   - font_size_halfpoints: 24 (= 12pt)\n"
+            f"   - line_spacing_twips: 480 (= double-spaced)\n"
+            f"   - body_first_line_indent_dxa: 720 (= 0.5 inch)\n"
+            f"5. sections array MUST contain (in order):\n"
+            f"   - title_page: spacing(3 blank lines), title(bold,centered), spacing(1), authors, affiliation\n"
+            f"   - abstract_page: abstract_label(bold,centered), abstract_body(no indent), keywords(items=[...], label_italic=true)\n"
+            f"   - body: title_repeat(bold,centered), body_paragraphs(0.5\" indent), headings H1/H2/H3, figure/table captions\n"
+            f"   - references_page: references_label(bold,centered), reference_entry(hanging_indent=true)\n"
+            f"6. ALL citation replacements must be applied INLINE in body text\n"
+            f"7. Include format_applied='APA 7th Edition' in top-level output\n\n"
+        )
+        _transform_expected = (
+            "Valid JSON with: format_applied, violations, changes_made, citation_replacements, "
+            "reference_conversions, reference_order, docx_instructions "
+            "(with format_id='apa7', font_size_halfpoints=24, line_spacing_twips=480, "
+            "body_first_line_indent_dxa=720, sections: [title_page, abstract_page, body, references_page])."
+        )
+    else:
+        _cit_rules = rules.get("citations", {})
+        _ref_rules = rules.get("references", {})
+        _doc_rules = rules.get("document", {})
+        _transform_specifics = (
+            f"CRITICAL REQUIREMENTS FOR {journal_style}:\n"
+            f"1. Citation format: {_cit_rules.get('style', _cit_rules.get('format', 'see rules'))} "
+            f"— brackets: {_cit_rules.get('brackets', 'see rules')}\n"
+            f"2. Reference ordering: {_ref_rules.get('ordering', 'see rules')}\n"
+            f"3. Reference style: follow the format templates in the rules JSON exactly\n"
+            f"4. Hanging indent: {_ref_rules.get('hanging_indent', False)}\n"
+            f"5. Document: font={_doc_rules.get('font', '?')}, "
+            f"size={_doc_rules.get('font_size', '?')}pt, "
+            f"spacing={_doc_rules.get('line_spacing', '?')}, "
+            f"alignment={_doc_rules.get('alignment', '?')}\n"
+            f"6. Generate docx_instructions with a FLAT sections array containing:\n"
+            f"   types: title, abstract, heading (with level), paragraph, reference, "
+            f"figure_caption, table_caption\n"
+            f"   Each section has: type, content, and relevant formatting flags\n"
+            f"7. ALL citation/reference changes must be applied INLINE in body text\n\n"
+        )
+        _transform_expected = (
+            "Valid JSON with: violations, changes_made, citation_replacements, "
+            "reference_conversions, reference_order, docx_instructions "
+            "(with flat sections array: [title, abstract, heading, paragraph, reference, ...])."
+        )
+
     transform_task = Task(
         description=(
-            f"You are a Manuscript Transformation Engine for {journal_style}.\n\n"
-            f"You have:\n"
-            f"1. The paper_structure JSON — from the parse step (previous context)\n"
-            f"2. Pre-computed section word counts (Python-exact):\n"
-            f"{_section_stats_text}"
-            f"3. A SECTION-BY-SECTION FORMATTING GUIDE — apply each section's rules precisely\n"
-            f"4. The complete journal rules JSON\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"PHASE A — INLINE VIOLATION SCAN (do first):\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Systematically check each rule category against the paper_structure:\n"
-            f"  abstract:   word count vs max_words; structured format required?\n"
-            f"  headings:   case (Title Case / UPPER CASE / Sentence case) correct?\n"
-            f"  citations:  format (numbered/author_date) matches in-text patterns?\n"
-            f"  references: ordering (alphabetical/numbered), et_al threshold met?\n"
-            f"  figures:    caption position and format pattern correct?\n"
-            f"  tables:     caption position and notes format correct?\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"PHASE B — GENERATE TRANSFORMATION INSTRUCTIONS:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Process each section independently with its specific rules:\n"
-            f"  ABSTRACT: Apply word limit. PRESERVE VERBATIM text — only trim if over limit.\n"
-            f"  HEADINGS: Apply EXACT case transform per H1/H2/H3 rules, bold, italic, centered.\n"
-            f"  BODY PARAGRAPHS: Apply font, font_size, line_spacing.\n"
-            f"  IN-TEXT CITATIONS: Reformat ALL citations to required format.\n"
-            f"  REFERENCES: Sort to correct order, apply style.\n"
-            f"  FIGURES/TABLES: Apply caption position and format pattern.\n\n"
-            f"Output JSON with EXACTLY these top-level keys:\n\n"
-            f"violations: list of objects — one per violation found in PHASE A:\n"
-            f"  {{rule_category, rule_description, rule_reference, violation_found, fix_applied}}\n\n"
-            f"changes_made: list of objects — one per change applied, each:\n"
-            f"  {{\"what\": \"human-readable description of the fix\",\n"
-            f"   \"rule_reference\": \"journal rule section e.g. 'IEEE Ref Guide §III'\",\n"
-            f"   \"why\": \"why this was required e.g. 'Required by IEEE Ref Guide §III'\"}}\n\n"
-            f"docx_instructions: object with:\n"
-            f"  font, font_size, line_spacing, margins (top/bottom/left/right in inches),\n"
-            f"  sections: list of ALL content in document order, each:\n"
-            f"    {{type: HEADING_H1|HEADING_H2|HEADING_H3|BODY_PARAGRAPH|ABSTRACT|\n"
-            f"           FIGURE_CAPTION|TABLE_CAPTION|REFERENCE_ENTRY,\n"
-            f"     content: <VERBATIM original text — do NOT rephrase or paraphrase>,\n"
-            f"     level: 1|2|3 (headings only)}}\n\n"
-            f"citation_replacements: list of {{original, replacement}} for in-text changes\n\n"
-            f"reference_order: list of reference strings in correct journal order\n\n"
-            f"CRITICAL RULE: Every 'content' field MUST be VERBATIM original text.\n"
-            f"Never summarize, paraphrase, or rewrite content — only FORMAT it.\n\n"
-            f"{section_rules_guide}\n\n"
-            f"Full journal rules:\n"
-            f"{json.dumps(rules, indent=2)}\n\n"
-            f"Return ONLY valid JSON — no markdown fences, no explanation."
+            _transform_common_prefix + _transform_specifics
+            + "Return ONLY valid JSON — no markdown fences, no explanation."
         ),
-        expected_output=(
-            "Valid JSON with: violations (PHASE A scan results), changes_made (list of strings), "
-            "docx_instructions (font, font_size, line_spacing, margins, sections list with "
-            "type/content/level per block), citation_replacements, reference_order."
-        ),
+        expected_output=_transform_expected,
         agent=transform_agent,
         context=[parse_task],
     )
@@ -821,30 +925,66 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         except Exception as _e:
             logger.warning("[PIPELINE] Abstract word count extraction failed: %s", _e)
 
+    # ── Build validate task description — APA-specific vs generic ───────────
+    _validate_common = (
+        f"Validate this transformed paper against {journal_style}:\n\n"
+        f"<transform_output>\n"
+        f"The transform output from the previous TRANSFORM step.\n"
+        f"</transform_output>\n\n"
+        f"<journal_rules>\n{json.dumps(rules, indent=2)}\n</journal_rules>\n\n"
+        f"SYSTEM-VERIFIED FACTS (use these exact values):\n"
+        f"- Abstract word count: {abstract_word_count} words\n"
+        f"- Abstract word limit: {abstract_word_limit} words\n"
+        f"- Over limit: {abstract_over_limit}\n"
+        f"{'- Apply -15 to abstract score.' if abstract_over_limit else '- Abstract within limit — no deduction.'}\n\n"
+    )
+
+    if is_apa:
+        _validate_checks = (
+            f"Perform ALL 7 compliance checks (APA 7th Edition):\n"
+            f"1. Citations (25%): ALL must be author-date (Author, Year). & in parenthetical, 'and' in narrative.\n"
+            f"   3+ authors: et al. with period. ZERO numbered citations remain. -10 per remaining numbered.\n"
+            f"2. References (25%): ALL in APA format: Author, F. M. (Year). Title. *Journal*, *Vol*(Issue), pages.\n"
+            f"   Alphabetical order, hanging indent, & before last author, en-dash page ranges.\n"
+            f"3. Citation ↔ Reference consistency: every citation has a reference, every reference is cited.\n"
+            f"4. Headings (15%): H1 bold+centered+NOT italic, H2 bold+left+NOT italic, H3 bold+italic+left.\n"
+            f"   IMRAD complete (Intro/Method/Results/Discussion). -25 per missing IMRAD section.\n"
+            f"5. Document format (10%): font_size_halfpoints=24, line_spacing_twips=480, margins=1440 DXA,\n"
+            f"   body_first_line_indent_dxa=720, alignment=left. -15 per wrong setting.\n"
+            f"6. Abstract (10%): ≤250 words, bold centered label, no first-line indent, keywords with italic label.\n"
+            f"7. Figures (7.5%) & Tables (7.5%): 'Figure N' not 'Fig.', sequential numbering, label bold, caption italic.\n\n"
+        )
+    else:
+        _cit_rules = rules.get("citations", {})
+        _ref_rules = rules.get("references", {})
+        _doc_rules = rules.get("document", {})
+        _h_rules = rules.get("headings", {})
+        _abs_rules = rules.get("abstract", {})
+        _validate_checks = (
+            f"Perform ALL 7 compliance checks against {journal_style} rules:\n"
+            f"1. Citations (25%): Must use {_cit_rules.get('style', _cit_rules.get('format', 'journal'))} format. "
+            f"Brackets: {_cit_rules.get('brackets', 'per rules')}.\n"
+            f"2. References (25%): {_ref_rules.get('ordering', 'per rules')} order. "
+            f"Hanging indent: {_ref_rules.get('hanging_indent', 'per rules')}.\n"
+            f"3. Citation ↔ Reference consistency: every citation has a reference, every reference is cited.\n"
+            f"4. Headings (15%): Check H1/H2/H3 styles match rules "
+            f"(bold, italic, centered, case, numbering per journal).\n"
+            f"5. Document format (10%): {_doc_rules.get('font', '?')} {_doc_rules.get('font_size', '?')}pt, "
+            f"spacing={_doc_rules.get('line_spacing', '?')}, alignment={_doc_rules.get('alignment', '?')}.\n"
+            f"6. Abstract (10%): ≤{_abs_rules.get('max_words', 250)} words, "
+            f"label bold={_abs_rules.get('label_bold', '?')}, keywords={_abs_rules.get('keywords_present', '?')}.\n"
+            f"7. Figures & Tables (15%): sequential numbering, correct caption position/style per rules.\n\n"
+        )
+
     validate_task = Task(
         description=(
-            "You have the transform output (violations, changes_made, docx_instructions) "
-            "and the journal rules. "
-            "Perform all 7 mandatory compliance checks:\n"
-            "1. Citation ↔ Reference 1:1 consistency\n"
-            "2. IMRAD structure completeness\n"
-            "3. Reference age (>50% older than 10 years → warning)\n"
-            "4. Self-citation rate (>30% same author → warning)\n"
-            "5. Figure sequential numbering (no gaps)\n"
-            "6. Table sequential numbering (no gaps)\n"
-            f"7. Abstract word count — VERIFIED BY SYSTEM: abstract contains "
-            f"{abstract_word_count} words, journal limit is {abstract_word_limit} words. "
-            f"Over limit: {abstract_over_limit}. "
-            f"{'Apply -15 to abstract score and add issue.' if abstract_over_limit else 'Abstract is within limit — no deduction.'}\n\n"
-            "Return the compliance_report as JSON with keys: "
-            "overall_score (0-100), breakdown (7 section scores + issues), "
-            "changes_made, imrad_check, citation_consistency, warnings. "
-            "Return ONLY valid JSON — no markdown fences, no explanation."
+            _validate_common + _validate_checks
+            + "Compute: overall_score = weighted sum. submission_ready = (score >= 80).\n"
+            + "Return ONLY valid JSON — no markdown fences, no explanation."
         ),
         expected_output=(
-            "Valid JSON compliance_report with overall_score, breakdown (7 sections "
-            "each with score and issues list), changes_made, imrad_check, "
-            "citation_consistency, and warnings."
+            "Valid JSON with: overall_score (0-100), checks/breakdown (7 sections each with "
+            "score, issues, details), submission_ready, warnings, summary."
         ),
         agent=validate_agent,
         context=[transform_task],
@@ -996,6 +1136,12 @@ def _get_task_output(crew: Crew, task_index: int) -> str:
                 f"Task at index {task_index} produced no output. "
                 "Pipeline may have failed silently at this step."
             )
+
+        # Prefer json_dict if available — CrewAI may have pre-parsed the JSON
+        if hasattr(output, "json_dict") and output.json_dict:
+            logger.debug("[PIPELINE] Task[%d] using json_dict (pre-parsed)", task_index)
+            return json.dumps(output.json_dict)
+
         if hasattr(output, "raw"):
             return output.raw
         if hasattr(output, "result"):
@@ -1042,11 +1188,12 @@ def _parse_compliance_report(raw: str) -> dict:
     report["overall_score"] = max(0, min(100, int(score)))
 
     # Validate breakdown — add placeholder scores for any missing sections (non-blocking)
+    # The new APA validate prompt uses "checks" key; normalize to "breakdown"
     required_sections = [
         "document_format", "abstract", "headings",
         "citations", "references", "figures", "tables",
     ]
-    breakdown = report.get("breakdown", {})
+    breakdown = report.get("breakdown", report.get("checks", {}))
     if not isinstance(breakdown, dict):
         breakdown = {}
     missing = [s for s in required_sections if s not in breakdown]
@@ -1165,15 +1312,35 @@ def _write_docx_from_transform(
     output_filename = f"formatted_{uuid.uuid4().hex[:8]}.docx"
     output_path = str(OUTPUT_DIR / output_filename)
 
-    # ── Path A: DOCX source — in-place transformation (figures/tables preserved) ──
+    # ── Check if LLM produced APA section-based format ──
+    sections = docx_instructions.get("sections") if isinstance(docx_instructions, dict) else None
+    section_types = set()
+    if isinstance(sections, list) and sections:
+        section_types = {s.get("type") for s in sections if isinstance(s, dict)}
+
+    is_apa_format = bool(section_types & {"title_page", "abstract_page", "references_page"})
+
+    # ── Path A: APA section-based format → always use build_apa_docx ──
+    # This applies proper APA formatting (title page, abstract page, body indent,
+    # hanging indent references, page numbers, heading styles) regardless of
+    # whether the input was PDF or DOCX. The LLM already produced the structured
+    # JSON with all content — build_apa_docx applies the formatting.
+    if is_apa_format:
+        logger.info("[DOCX] APA format detected — using build_apa_docx — %d sections → %s",
+                    len(sections), output_filename)
+        build_apa_docx(transform_data, output_path)
+        return output_filename
+
+    # ── Path B: Non-APA DOCX source — in-place transformation (figures/tables preserved) ──
+    # Only used for non-APA journals where preserving the original DOCX structure
+    # (figures, tables, equations) is more important than rebuilding from scratch.
     if source_docx_path and Path(source_docx_path).exists():
-        logger.info("[DOCX] In-place transformation — source=%s → %s",
+        logger.info("[DOCX] Non-APA in-place transformation — source=%s → %s",
                     Path(source_docx_path).name, output_filename)
         transform_docx_in_place(source_docx_path, transform_data, rules, output_path)
         return output_filename
 
-    # ── Path B: PDF / TXT — rebuild from extracted text ───────────────────────────
-    sections = docx_instructions.get("sections") if docx_instructions else None
+    # ── Path C: Non-APA PDF/TXT — rebuild from extracted text ─────────────────────
     if not isinstance(sections, list) or len(sections) == 0:
         raise TransformError(
             "docx_instructions is missing a non-empty 'sections' list. "
@@ -1182,6 +1349,7 @@ def _write_docx_from_transform(
             f"{list(docx_instructions.keys()) if isinstance(docx_instructions, dict) else '(not a dict)'}"
         )
 
+    # Legacy flat format — validate and normalize before write
     # 8B: Validate schema before write — catches LLM schema drift early
     _validate_docx_instructions(docx_instructions)
 
@@ -1194,7 +1362,7 @@ def _write_docx_from_transform(
 
     docx_instructions["sections"] = _normalize_section_types(sections)
     docx_instructions["rules"] = rules
-    logger.info("[DOCX] Rebuilding from text — %d sections → %s",
+    logger.info("[DOCX] Legacy format — rebuilding from text — %d sections → %s",
                 len(docx_instructions["sections"]), output_filename)
     write_formatted_docx(docx_instructions, output_path)
     return output_filename
