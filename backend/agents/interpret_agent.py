@@ -1,9 +1,9 @@
 """
-Agent 3: INTERPRET — Load and return journal formatting rules verbatim.
+Agent 3: INTERPRET — Analyze journal formatting rules and surface critical constraints.
 
-This agent does NOT call the LLM to generate rules for supported journals.
-Rules are loaded from rules/*.json via the load_journal_rules tool and returned
-exactly as stored — no modification, no summarization.
+This agent receives the pre-loaded rules JSON and enriches it by identifying
+the most critical formatting requirements that are commonly violated, adding
+a 'critical_checks' list per section and a 'style_summary' at the top level.
 """
 import json
 import time
@@ -13,6 +13,7 @@ from crewai import Agent
 from crewai.tools import tool
 
 from tools.logger import get_logger
+from tools.rule_extractor import extract_journal_rules_from_url
 from tools.rule_loader import load_rules as _load_rules
 from tools.tool_errors import LLMResponseError, RuleLoadError  # noqa: F401 — available for callers
 
@@ -124,65 +125,65 @@ def _safe_context(context: dict, key: str) -> Any:
 
 def create_interpret_agent(llm: Any) -> Agent:
     """
-    Agent 3: INTERPRET — Return exact journal rules JSON.
+    Agent 3: INTERPRET — Analyze journal rules and surface critical constraints.
 
-    Critical constraints:
-      - Does NOT call LLM to generate rules for supported journals
-      - Returns rules JSON exactly as loaded — no modification, no omission
-      - Uses load_journal_rules @tool as authoritative source
-      - Results are cached in _RULE_ENGINE_CACHE for repeated runs
-      - Raises RuleLoadError for unsupported journals
+    Receives the pre-loaded rules JSON from crew.py, analyzes it to identify
+    the most commonly violated formatting requirements, and returns the enriched
+    rules with 'critical_checks' per section and a 'style_summary'.
 
-    Required output keys (all 11 must be present):
+    Required output keys (all original 11 must be present + enrichment):
       style_name, document, title_page, abstract, headings,
-      citations, references, figures, tables, equations, general_rules
+      citations, references, figures, tables, equations, general_rules,
+      style_summary (new), critical_checks per section (new)
 
     Args:
         llm: Shared LLM string at temperature=0.
 
     Returns:
-        CrewAI Agent configured for rule loading.
+        CrewAI Agent configured for rule analysis.
     """
     logger.info("[INTERPRET] Agent created")
 
     return Agent(
-        role="Journal Formatting Rules Authority",
+        role="Journal Formatting Violation Scanner",
         goal=(
-            "Load and return the exact formatting rules for the requested journal style. "
-            "The rules are provided in your task context — return them exactly as-is.\n\n"
-            "CRITICAL CONSTRAINTS:\n"
-            "  1. Return the rules JSON EXACTLY as provided — zero modifications\n"
-            "  2. Do NOT rewrite, reword, summarize, or interpret any rule values\n"
-            "  3. Do NOT generate rules from memory — always use the loaded JSON\n"
-            "  4. If rules are not in context, use the 'Journal Rules Loader' tool\n"
-            "  5. For unsupported journals, raise RuleLoadError with supported journal list\n\n"
-            "SUPPORTED JOURNALS:\n"
-            "  APA 7th Edition | IEEE | Vancouver | Springer | Chicago\n\n"
-            "REQUIRED OUTPUT — all 11 top-level keys must be present:\n"
-            "  style_name, document, title_page, abstract, headings,\n"
-            "  citations, references, figures, tables, equations, general_rules\n\n"
-            "VALIDATION SELF-CHECK:\n"
-            "  Before returning, confirm all 11 keys are present in your output.\n"
-            "  If any key is missing, use the 'Journal Rules Loader' tool to reload.\n\n"
-            "Return ONLY valid JSON — no markdown fences, no explanation, no commentary."
+            "Scan a parsed manuscript against a journal's formatting rules and "
+            "identify the top violations that would cause desk rejection.\n\n"
+            "YOUR TASK:\n"
+            "  1. Receive the parsed paper_structure JSON from the parse step\n"
+            "  2. Cross-reference every paper element against the provided journal rules\n"
+            "  3. For each rule category (abstract, headings, citations, references, "
+            "figures, tables, font/margins), determine if a violation exists in the manuscript\n"
+            "  4. Rank the top 5 violations by desk rejection risk\n"
+            "  5. For each violation, provide an exact fix_instruction the Transform agent "
+            "can execute directly\n\n"
+            "OUTPUT must be a JSON object with these keys:\n"
+            "  journal: name of the journal\n"
+            "  total_violations_found: integer count\n"
+            "  critical_violations: list of up to 5 objects, each with:\n"
+            "    rule_category: e.g. 'abstract', 'headings', 'citations'\n"
+            "    rule_description: exact rule text from the journal rules\n"
+            "    rule_reference: e.g. 'APA 7th §8.11'\n"
+            "    violation_found: what is wrong in this specific manuscript\n"
+            "    fix_instruction: precise, actionable transformation instruction\n"
+            "  rule_summary: 2-sentence plain-English summary of what needs to change\n\n"
+            "Return ONLY valid JSON — no markdown fences, no explanation."
         ),
         backstory=(
-            "You are the authoritative source for academic journal formatting rules in "
-            "the Agent Paperpal pipeline. You have memorised the exact, official submission "
-            "guidelines for all five supported journals: APA 7th Edition, IEEE style, "
-            "Vancouver/ICMJE, Springer Basic, and Chicago Manual of Style. "
-            "You never paraphrase or interpret — you retrieve and return the precise, "
-            "machine-readable rules exactly as defined in the official guidelines. "
-            "The Transform agent consumes your output directly to check every formatting "
-            "element against journal requirements. Any modification to the rules — even a "
-            "single value change — would cause incorrect formatting decisions downstream. "
-            "Your job is retrieval, not interpretation. "
-            "Rules are cached in memory — if you have already loaded the rules for a journal "
-            "in this session, the cached version is returned instantly without disk access, "
-            "making repeated runs significantly faster during hackathon demos."
+            "You are a senior academic editor with 20 years of experience reviewing "
+            "manuscripts for APA, IEEE, Vancouver, Springer, and Chicago style journals. "
+            "You have reviewed over 300,000 manuscripts and know exactly which formatting "
+            "rules authors violate most often. "
+            "When given a manuscript and its target journal's rules, you immediately spot "
+            "the violations that cause desk rejections: abstract word limit exceeded, "
+            "wrong citation style, heading case violations, reference ordering errors, "
+            "missing figure caption format. "
+            "You don't just list rules — you compare the actual manuscript content against "
+            "the rules and produce specific, actionable fix instructions that the Transform "
+            "agent can execute without any ambiguity."
         ),
         llm=llm,
-        tools=[load_journal_rules],
+        tools=[load_journal_rules, extract_journal_rules_from_url],
         allow_delegation=False,
         verbose=True,
         max_iter=3,

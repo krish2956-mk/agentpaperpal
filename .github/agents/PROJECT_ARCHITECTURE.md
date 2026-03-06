@@ -53,9 +53,9 @@ description: Agent Paperpal — Autonomous Manuscript Formatting System. HackaMi
 | Frontend HTTP | Axios | latest |
 | Backend | FastAPI + Uvicorn | 0.111.0 / 0.29.0 |
 | Backend Language | Python 3.11+ | 3.11+ |
-| AI Brain | Gemini 2.0 Flash via Google AI Studio | gemini-2.0-flash |
+| AI Brain | Gemini 2.5 Flash via Google AI Studio | gemini-2.5-flash |
 | Agent Framework | CrewAI (sequential pipeline) | 0.36.0+ |
-| LLM Client | LiteLLM (built into CrewAI) — string format "gemini/gemini-2.0-flash" | built-in |
+| LLM Client | LiteLLM (built into CrewAI) — string format "gemini/gemini-2.5-flash" | built-in |
 | PDF Reading | PyMuPDF (fitz) | 1.24.0 |
 | DOCX Read/Write | python-docx | 1.1.0 |
 | File Upload | python-multipart | 0.0.9 |
@@ -72,32 +72,29 @@ description: Agent Paperpal — Autonomous Manuscript Formatting System. HackaMi
 ```
 paperpal-agent/
 ├── backend/
-│   ├── main.py                  ← FastAPI routing ONLY — zero business logic
-│   ├── crew.py                  ← CrewAI assembly + kickoff + run_pipeline()
+│   ├── main.py                  ← FastAPI routing + BackgroundTasks (8C async)
+│   ├── crew.py                  ← CrewAI assembly + run_pipeline() + JOB_STORE
 │   ├── agents/
 │   │   ├── __init__.py
-│   │   ├── ingest_agent.py      ← Agent 1: Read + extract file content
+│   │   ├── ingest_agent.py      ← Agent 1: Extract + label content elements
 │   │   ├── parse_agent.py       ← Agent 2: Detect paper structure via LLM
-│   │   ├── interpret_agent.py   ← Agent 3: Load journal rules from JSON
-│   │   ├── transform_agent.py   ← Agent 4: Fix violations via LLM + docx_writer
-│   │   └── validate_agent.py    ← Agent 5: Score compliance 0-100
+│   │   ├── transform_agent.py   ← Agent 3: Violations + DOCX instructions (Phase A+B)
+│   │   └── validate_agent.py    ← Agent 4: Score compliance 0-100
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── pdf_reader.py        ← PyMuPDF text extraction
 │   │   ├── docx_reader.py       ← python-docx text extraction
-│   │   ├── docx_writer.py       ← python-docx formatted output generation
-│   │   └── rule_loader.py       ← JSON rules loading + JOURNAL_MAP lookup
+│   │   ├── docx_writer.py       ← python-docx formatted output + transform_docx_in_place()
+│   │   ├── rule_loader.py       ← JSON rules loading + JOURNAL_MAP lookup
+│   │   ├── text_chunker.py      ← Section-aware context: split_into_sections()
+│   │   ├── compliance_checker.py ← Deterministic rule checks: run_deterministic_checks()
+│   │   └── rule_extractor.py    ← BeautifulSoup HTML rule scraping (fallback)
 │   ├── rules/
 │   │   ├── apa7.json            ← APA 7th Edition rules
 │   │   ├── ieee.json            ← IEEE rules
 │   │   ├── vancouver.json       ← Vancouver rules
 │   │   ├── springer.json        ← Springer rules
 │   │   └── chicago.json         ← Chicago rules
-│   ├── schemas/
-│   │   └── rules_schema.json    ← JSON Schema to validate rules/*.json
-│   ├── engine/
-│   │   ├── __init__.py
-│   │   └── format_engine.py     ← FormatEngine class + load_format_engine()
 │   ├── uploads/                 ← Temp uploaded files (git-ignored)
 │   ├── outputs/                 ← Formatted output DOCX files (git-ignored)
 │   ├── .env                     ← GEMINI_API_KEY + GOOGLE_API_KEY (never commit)
@@ -105,12 +102,14 @@ paperpal-agent/
 │
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx              ← Root component + state machine
+│   │   ├── App.jsx              ← Root component + state machine + async polling
 │   │   ├── components/
-│   │   │   ├── Upload.jsx       ← File drag/drop + journal selector + submit
-│   │   │   ├── BeforeAfter.jsx  ← Side-by-side document comparison
-│   │   │   ├── ComplianceScore.jsx ← Score dashboard with per-section bars
-│   │   │   └── ChangesList.jsx  ← Explainable list of all corrections made
+│   │   │   ├── Upload.jsx           ← File drag/drop + journal selector + submit
+│   │   │   ├── ProcessingLoader.jsx ← Animated pipeline progress steps
+│   │   │   ├── ComplianceScore.jsx  ← Score dashboard with per-section bars
+│   │   │   ├── ChangesList.jsx      ← Explainable list of corrections with rule refs
+│   │   │   ├── ViolationsDetected.jsx ← Phase A violations from transform agent
+│   │   │   └── IMRADCheck.jsx       ← IMRAD structure completeness display
 │   │   └── index.css            ← Tailwind + dark theme tokens
 │   ├── package.json
 │   └── vite.config.js
@@ -128,11 +127,17 @@ paperpal-agent/
 ### 4.1 Processing Pipeline — Sequential CrewAI Agents
 
 ```
-INGEST → PARSE → INTERPRET → TRANSFORM → VALIDATE
-  ↓        ↓         ↓            ↓           ↓
-Raw      Paper     Journal    Formatted    Compliance
-Content  Structure  Rules     DOCX         Report
+INGEST → PARSE → TRANSFORM → VALIDATE
+  ↓        ↓          ↓           ↓
+Raw      Paper    Formatted    Compliance
+Content  Structure  DOCX         Report
 ```
+
+**Pre-pipeline**: `text_chunker.split_into_sections()` pre-labels IMRAD structure in `crew.py` before agents run.
+**Rules loading**: `rule_loader.load_rules()` called directly in `crew.py` (not by a separate agent).
+**Phase A (Transform)**: Violation detection — compare paper vs rules, produce violations list.
+**Phase B (Transform)**: DOCX instruction generation — docx_instructions.sections drives the DOCX writer.
+**Post-pipeline**: `compliance_checker.run_deterministic_checks()` applies rule-based scoring on top of LLM output.
 
 Each agent has ONE job. Never combine responsibilities. Context flows automatically via CrewAI task output chaining.
 
@@ -210,8 +215,9 @@ Each agent has ONE job. Never combine responsibilities. Context flows automatica
 
 | Method | Path | Description | Auth |
 |--------|------|-------------|------|
-| GET | `/health` | Health check | None |
-| POST | `/format` | Upload + format document | None |
+| GET | `/health` | Health check + supported journals | None |
+| POST | `/format` | Upload + format document (sync or async) | None |
+| GET | `/status/{job_id}` | Poll async job status | None |
 | GET | `/download/{filename}` | Download formatted DOCX | None |
 
 ### POST /format — Request
@@ -223,15 +229,39 @@ Fields:
   - journal: string (one of: "APA 7th Edition", "IEEE", "Vancouver", "Springer", "Chicago")
 ```
 
-### POST /format — Response (Success)
+### POST /format — Response (Sync, small files ≤500KB)
 
 ```json
 {
   "success": true,
   "download_url": "/download/formatted_abc12345.docx",
   "compliance_report": { ... ComplianceReport schema ... },
+  "changes_made": [
+    "Reformatted 14 in-text citations to author-date style (APA 7th §8.11 — author-date format required)",
+    "Converted heading to Title Case (APA 7th §2.27 — H1 headings must be centered Title Case)"
+  ],
+  "interpretation_results": { "violations": [...], "changes_made": [...] },
   "processing_time_seconds": 42.3
 }
+```
+
+### POST /format — Response (Async, large files >500KB)
+
+```json
+{
+  "job_id": "abc12345",
+  "poll_url": "/status/abc12345",
+  "status": "processing"
+}
+```
+HTTP 202 Accepted. Frontend polls `/status/{job_id}` every 4 seconds.
+
+### GET /status/{job_id} — Polling Response
+
+```json
+{ "status": "processing" }
+{ "status": "done", "result": { ... same as sync success response ... } }
+{ "status": "error", "error": "Pipeline execution failed." }
 ```
 
 ### POST /format — Response (Error)
@@ -249,13 +279,19 @@ Fields:
 - File size MUST be ≤ 10MB (10 * 1024 * 1024 bytes)
 - Extracted text MUST be ≥ 100 characters
 - Journal MUST be one of the 5 supported styles
+- Files >500KB are processed asynchronously via BackgroundTasks (8C)
 
 ---
 
 ## 6. Agent Responsibilities (ONE JOB PER AGENT — NEVER COMBINE)
 
+### Pre-Pipeline (crew.py, NOT an agent)
+- `text_chunker.split_into_sections()` pre-labels IMRAD structure → section-aware context
+- `rule_loader.load_rules(journal)` loads rules JSON → passed directly to transform/validate tasks
+- Rules loading is deterministic — no LLM needed for known journals
+
 ### Agent 1: INGEST
-- **Input**: Raw file path + paper content text
+- **Input**: Raw file path + paper content text (section-labeled by text_chunker)
 - **Job**: Structure and label all content elements with type markers
 - **Output**: Structured raw content with element markers
 - **Tools used**: pdf_reader.py, docx_reader.py
@@ -264,37 +300,32 @@ Fields:
 
 ### Agent 2: PARSE
 - **Input**: Raw content from Agent 1
-- **Job**: Call GPT-4o-mini to identify ALL structural elements
+- **Job**: Call Gemini to identify ALL structural elements
 - **Output**: Valid JSON matching paper_structure schema (temperature=0)
 - **Tools used**: None (pure LLM task)
 - **LLM used**: YES (primary reasoning task)
 - **NEVER**: Load rules, fix violations, score compliance
 
-### Agent 3: INTERPRET
-- **Input**: Journal name string from inputs
-- **Job**: Load the correct rules JSON file via JOURNAL_MAP lookup
-- **Output**: Complete journal rules JSON
-- **Tools used**: rule_loader.py
-- **LLM used**: ONLY as fallback for unsupported journals (generate rules dynamically)
-- **NEVER**: Parse paper structure, fix violations, score
-
-### Agent 4: TRANSFORM
-- **Input**: paper_structure (from Agent 2) + rules (from Agent 3)
-- **Job**: Compare every element → identify violations → generate docx_instructions → call docx_writer → save formatted DOCX
-- **Output**: JSON with violations list, changes_made list, docx_path
-- **Tools used**: docx_writer.py
+### Agent 3: TRANSFORM (Phase A + Phase B)
+- **Input**: paper_structure (from Agent 2) + rules (from crew.py)
+- **Phase A**: Compare every element → identify violations → produce violations list
+- **Phase B**: Generate docx_instructions.sections → call docx_writer → save formatted DOCX
+- **Output**: JSON with violations, changes_made (with rule §refs), docx_instructions.sections
+- **Tools used**: docx_writer.py (write_formatted_docx + transform_docx_in_place)
 - **LLM used**: YES (comparison + instruction generation, temperature=0)
+- **Validation**: `_validate_transform_output()` ensures sections non-empty before DOCX write (8B)
+- **Verbatim guard**: `_guard_section_contents()` prevents content truncation (8A)
 - **NEVER**: Re-parse structure, load rules again, score compliance
 
-### Agent 5: VALIDATE
+### Agent 4: VALIDATE
 - **Input**: Formatted document content + journal rules
 - **Job**: Perform 7 compliance checks, score each 0-100
 - **Output**: Complete compliance_report JSON
-- **Tools used**: None (pure LLM analysis)
+- **Tools used**: compliance_checker.py (`apply_deterministic_checks()` post-processing)
 - **LLM used**: YES (validation logic, temperature=0)
 - **NEVER**: Make further edits, re-run transformation
 
-### 7 Validation Checks Agent 5 MUST Perform:
+### 7 Validation Checks Agent 4 MUST Perform:
 1. Citation ↔ Reference 1:1 consistency (orphan citations + uncited references)
 2. IMRAD structure completeness (all 4 sections present)
 3. Reference age (flag if >50% older than 10 years)
@@ -302,6 +333,14 @@ Fields:
 5. Figure sequential numbering (no gaps: 1, 2, 3...)
 6. Table sequential numbering (no gaps: 1, 2, 3...)
 7. Abstract word count vs journal limit
+
+### Reliability Features (8A / 8B / 8C)
+
+| Feature | Where | What it does |
+|---------|-------|-------------|
+| 8A Verbatim Guard | `crew.py._guard_section_contents()` | Filters empty sections; restores truncated abstract from paper_structure |
+| 8B Schema Validation | `crew.py._validate_docx_instructions()` | jsonschema check on docx_instructions before DOCX write — fail fast |
+| 8C Async Processing | `main.py` + `crew.py.JOB_STORE` | Files >500KB processed via BackgroundTasks; frontend polls `/status/{job_id}` |
 
 ---
 
@@ -393,9 +432,9 @@ Any journal name NOT in this map falls back to LLM-generated rules via interpret
 | State | Component Shown |
 |-------|----------------|
 | `idle` | Upload component (drag/drop + journal select + submit button) |
-| `loading` | Pipeline steps progress with animated spinner + step dots |
-| `success` | ComplianceScore + ChangesList + Download button + "Format Another" |
-| `error` | Error message + "Try Again" button |
+| `loading` | ProcessingLoader — animated spinner + step dots + step name. If async job: stays in loading state while polling `/status/{job_id}` every 4s |
+| `success` | ComplianceScore + ViolationsDetected + IMRADCheck + ChangesList + RecommendationsCard + Download button + "Format Another" |
+| `error` | Error message (with step info if available) + "Try Again" button |
 
 **UI Theme**: Dark (bg-gray-950 background, white text, blue-400 accents)
 
@@ -407,13 +446,15 @@ Any journal name NOT in this map falls back to LLM-generated rules via interpret
 |-----------|------------------|
 | PDF with no extractable text (scanned) | Return 400: "Could not extract text from document" |
 | DOCX with only images | Return 400: extracted text < 100 chars threshold |
-| Unknown journal name | rule_loader falls back to LLM-generated rules |
-| LLM returns malformed JSON | Agent retries with explicit "return ONLY valid JSON" instruction |
-| Pipeline takes > 120s | Frontend axios timeout 120000ms returns timeout error |
+| Unknown journal name | rule_loader raises KeyError; validated in main.py before pipeline |
+| LLM returns malformed JSON | Agent retries with explicit "return ONLY valid JSON" instruction; crew.py extract_json_from_llm() cleans markdown fences |
 | Large paper (>10MB) | Return 400 before pipeline starts |
+| Large file (>500KB) | HTTP 202 + async job; frontend polls /status/{job_id} every 4s (8C) |
 | Empty violation list (perfect paper) | Still generate compliance report with score ~95-100 |
+| docx_instructions.sections empty | `_validate_docx_instructions()` raises TransformError before DOCX write (8B) |
+| Abstract truncated by LLM | `_guard_section_contents()` restores from paper_structure (8A) |
 | File not found on download | Return 404 |
-| OpenAI API rate limit hit | CrewAI handles retry internally; log error if exhausted |
+| Gemini API rate limit hit | CrewAI handles retry internally (max_iter=3); log error if exhausted |
 
 ---
 
@@ -421,12 +462,13 @@ Any journal name NOT in this map falls back to LLM-generated rules via interpret
 
 | Concern | Expectation |
 |---------|-------------|
-| Processing time | 40-60 seconds per paper (GPT-4o-mini is fast) |
-| Concurrent requests | 1-2 (hackathon demo — not production scale) |
+| Processing time | 40-90 seconds per paper (small files sync, large files async) |
+| Concurrent requests | 1-2 sync + unlimited async background jobs |
 | Max file size | 10MB |
 | Output file | ~50-200KB DOCX |
 | Journal support | 5 (extensible via new JSON file only) |
-| API cost per paper | ~$0.01-0.05 (GPT-4o-mini pricing) |
+| API cost per paper | Free tier via Google AI Studio (Gemini 2.5 Flash) |
+| Async threshold | >500KB → HTTP 202 + BackgroundTasks + JOB_STORE polling |
 
 Adding a new journal: Create `rules/newjournal.json` + add entry to `JOURNAL_MAP`. Zero code changes required.
 

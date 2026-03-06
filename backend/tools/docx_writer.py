@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -330,6 +331,194 @@ def _add_table_caption(doc: Document, text: str, tbl_rules: dict, font_name: str
     bold = tbl_rules.get("label_bold", True)
     run = para.add_run(text)
     _apply_font(run, font_name, font_size - 1, bold=bold)
+
+
+def transform_docx_in_place(
+    source_docx_path: str,
+    transform_data: dict,
+    rules: dict,
+    output_path: str,
+) -> str:
+    """
+    Apply journal formatting transformations to a source DOCX in-place.
+
+    Unlike write_formatted_docx() which rebuilds the document from extracted
+    text, this function opens the original DOCX and applies ONLY the required
+    formatting changes. All figures (InlineShape), tables (XML), equations
+    (OMML), and embedded objects are preserved untouched.
+
+    Transformations applied:
+      Pass 1 — Normal style: font family, font size, line spacing
+      Pass 2 — Page margins: top / bottom / left / right (all sections)
+      Pass 3 — Headings: case, bold, italic, centered, font size
+      Pass 4 — Reference reordering: alphabetical or per transform_data order
+
+    Args:
+        source_docx_path: Path to the original uploaded DOCX.
+        transform_data: Dict from the transform agent (provides reference_order).
+        rules: Journal rules dict (source of truth for all formatting values).
+        output_path: Absolute path where the transformed DOCX should be saved.
+
+    Returns:
+        output_path on success.
+
+    Raises:
+        DocumentWriteError: If the source DOCX cannot be opened or saved.
+    """
+    try:
+        doc = Document(source_docx_path)
+    except Exception as e:
+        raise DocumentWriteError(f"Cannot open source DOCX '{source_docx_path}': {e}") from e
+
+    doc_rules      = rules.get("document", {})
+    headings_rules = rules.get("headings", {})
+    ref_rules      = rules.get("references", {})
+
+    font_name       = doc_rules.get("font", "Times New Roman")
+    font_size_pt    = _safe_int(doc_rules.get("font_size", 12), 12)
+    line_spacing_v  = _safe_float(doc_rules.get("line_spacing", 2.0), 2.0)
+    margins         = doc_rules.get("margins", {})
+
+    # ── Pass 1: Normal style — font + line spacing ────────────────────────
+    try:
+        normal = doc.styles["Normal"]
+        normal.font.name = font_name
+        normal.font.size = Pt(font_size_pt)
+        _apply_line_spacing(normal.paragraph_format, line_spacing_v)
+        logger.debug("[DOCX_INPLACE] Normal style set — font=%s size=%dpt spacing=%.1f",
+                     font_name, font_size_pt, line_spacing_v)
+    except Exception as e:
+        logger.warning("[DOCX_INPLACE] Could not set Normal style: %s", e)
+
+    # ── Pass 2: Page margins ──────────────────────────────────────────────
+    for sec in doc.sections:
+        try:
+            sec.top_margin    = Inches(_parse_measurement(margins.get("top",    1.0)))
+            sec.bottom_margin = Inches(_parse_measurement(margins.get("bottom", 1.0)))
+            sec.left_margin   = Inches(_parse_measurement(margins.get("left",   1.0)))
+            sec.right_margin  = Inches(_parse_measurement(margins.get("right",  1.0)))
+        except Exception as e:
+            logger.warning("[DOCX_INPLACE] Could not set margins: %s", e)
+
+    # ── Pass 3: Headings ──────────────────────────────────────────────────
+    for para in doc.paragraphs:
+        if not para.style.name.startswith("Heading"):
+            continue
+        try:
+            level = int(para.style.name.split()[-1])
+        except (ValueError, IndexError):
+            level = 1
+
+        h_rules  = headings_rules.get(f"H{level}", {})
+        case     = h_rules.get("case", None)
+        bold     = h_rules.get("bold", True)
+        italic   = h_rules.get("italic", False)
+        centered = h_rules.get("centered", False)
+        h_size   = _safe_int(h_rules.get("font_size", font_size_pt), font_size_pt)
+
+        if centered:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        if case:
+            new_text = _apply_case_transform(para.text, case)
+            if new_text != para.text:
+                _replace_paragraph_text_preserve_runs(para, new_text)
+
+        for run in para.runs:
+            try:
+                run.bold        = bold
+                run.italic      = italic
+                run.font.name   = font_name
+                run.font.size   = Pt(h_size)
+            except Exception as e:
+                logger.warning("[DOCX_INPLACE] Heading run format error: %s", e)
+
+    # ── Pass 4: Reference reordering ──────────────────────────────────────
+    reference_order = transform_data.get("reference_order", [])
+    _reorder_references_in_place(doc, reference_order, ref_rules)
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        doc.save(str(out))
+    except Exception as e:
+        raise DocumentWriteError(f"Failed to save in-place DOCX to '{out}': {e}") from e
+
+    logger.info("[DOCX_INPLACE] Saved — file=%s", out.name)
+    return str(out)
+
+
+def _replace_paragraph_text_preserve_runs(para, new_text: str) -> None:
+    """
+    Replace the full text of a paragraph while preserving the first run's
+    character formatting (bold, italic, font, size). All subsequent runs are
+    cleared so the paragraph contains exactly one run with the new text.
+    """
+    if not para.runs:
+        para.text = new_text
+        return
+    para.runs[0].text = new_text
+    for run in para.runs[1:]:
+        run.text = ""
+
+
+def _reorder_references_in_place(doc: Document, reference_order: list, ref_rules: dict) -> None:
+    """
+    Reorder reference-list paragraphs in the document body.
+
+    Strategy:
+      1. Locate the "References" heading paragraph.
+      2. Collect non-empty body paragraphs after it (stopping at the next heading).
+      3. If transform_data provided a reference_order list of the same length,
+         use that ordering. Otherwise sort alphabetically (APA/Chicago).
+      4. Update each paragraph's text in-place, preserving run formatting.
+
+    If the counts don't match (LLM may have added/removed refs), falls back to
+    using the first N ordered items to patch existing paragraphs.
+    """
+    paragraphs = doc.paragraphs
+
+    # Find the references heading
+    ref_start_idx: Optional[int] = None
+    for i, para in enumerate(paragraphs):
+        if re.search(r"^\s*references?\s*$", para.text, re.IGNORECASE):
+            ref_start_idx = i
+            break
+
+    if ref_start_idx is None:
+        logger.debug("[DOCX_INPLACE] No references heading found — skipping reorder")
+        return
+
+    # Collect body paragraphs in the references section
+    ref_paras = []
+    for para in paragraphs[ref_start_idx + 1:]:
+        if para.style.name.startswith("Heading"):
+            break
+        if para.text.strip():
+            ref_paras.append(para)
+
+    if not ref_paras:
+        logger.debug("[DOCX_INPLACE] References section empty — nothing to reorder")
+        return
+
+    # Determine ordered texts
+    if reference_order and len(reference_order) == len(ref_paras):
+        ordered = reference_order
+    else:
+        # Default: alphabetical (APA, Chicago) — numbered styles (IEEE, Vancouver)
+        # should not be sorted, but the transform agent will pass a correct list
+        ordering = ref_rules.get("ordering", "alphabetical")
+        if ordering == "alphabetical":
+            ordered = sorted([p.text for p in ref_paras], key=str.lower)
+        else:
+            ordered = [p.text for p in ref_paras]  # keep original order
+
+    # Apply in-place — update text of each paragraph
+    for para, new_text in zip(ref_paras, ordered):
+        if para.text != new_text:
+            _replace_paragraph_text_preserve_runs(para, new_text)
+
+    logger.info("[DOCX_INPLACE] References reordered — %d entries", len(ref_paras))
 
 
 def _safe_int(value, default: int) -> int:

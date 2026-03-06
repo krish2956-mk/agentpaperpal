@@ -44,7 +44,7 @@ function AnimatedBar({ score, colorClass }) {
 }
 
 // Section row with collapsible issues (collapse after MAX_VISIBLE_ISSUES)
-function SectionRow({ label, score, issues }) {
+function SectionRow({ label, score, issues, verified }) {
   const [showAll, setShowAll] = useState(false);
   const colors = getScoreColors(score ?? 0);
   const hasIssues = issues && issues.length > 0;
@@ -56,6 +56,11 @@ function SectionRow({ label, score, issues }) {
       <div className="flex items-center gap-2">
         {getScoreIcon(score ?? 0)}
         <span className="text-sm text-gray-300 flex-1">{label}</span>
+        {verified && (
+          <span className="text-xs font-mono text-green-500 bg-green-950/40 border border-green-800/40 rounded px-1.5 py-0.5 shrink-0">
+            ✓ verified
+          </span>
+        )}
         <span className={`text-xs font-semibold tabular-nums ${typeof score === "number" ? colors.text : "text-gray-600"}`}>
           {typeof score === "number" ? `${score}/100` : "N/A"}
         </span>
@@ -180,6 +185,7 @@ export default function ComplianceScore({ report }) {
                 label={label}
                 score={val?.score}
                 issues={val?.issues || []}
+                verified={val?.verified === true}
               />
             );
           })

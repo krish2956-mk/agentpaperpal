@@ -2,7 +2,7 @@
 
 > FastAPI + CrewAI + Google Gemini — 5-agent autonomous manuscript formatting pipeline.
 
-The backend is responsible for accepting research paper uploads, running the 5-agent CrewAI pipeline that detects and fixes formatting violations, writing the formatted DOCX output, and returning a scored compliance report.
+The backend is responsible for accepting research paper uploads, running the 4-agent CrewAI pipeline that detects and fixes formatting violations, writing the formatted DOCX output, and returning a scored compliance report. Large files (>500KB) are processed as background jobs with polling via `GET /status/{job_id}`.
 
 ---
 
@@ -10,6 +10,7 @@ The backend is responsible for accepting research paper uploads, running the 5-a
 
 - [Architecture Overview](#architecture-overview)
 - [Agent Pipeline](#agent-pipeline)
+- [Reliability Features (8A/8B/8C)](#reliability-features-8a8b8c)
 - [Directory Structure](#directory-structure)
 - [Technology Stack](#technology-stack)
 - [API Reference](#api-reference)
@@ -35,6 +36,7 @@ graph TB
         Health["GET /health\nSystem status + journals"]
         Format["POST /format\nUpload + validate + run pipeline"]
         Download["GET /download/:file\nServe formatted DOCX"]
+        Status["GET /status/:job_id\nPoll async job (8C)"]
     end
 
     subgraph "Validation Pipeline"
@@ -45,11 +47,10 @@ graph TB
         V5["5. Alpha ratio check\n(>= 0.3, rejects scanned PDFs)"]
     end
 
-    subgraph "CrewAI Pipeline"
+    subgraph "CrewAI Pipeline (4 agents)"
         A1["INGEST\nLabel content blocks"]
         A2["PARSE\nExtract paper_structure"]
-        A3["INTERPRET\nLoad journal rules"]
-        A4["TRANSFORM\nProduce docx_instructions"]
+        A4["TRANSFORM\nPhase A: scan violations\nPhase B: apply fixes"]
         A5["VALIDATE\n7 checks + score 0-100"]
     end
 
@@ -63,8 +64,8 @@ graph TB
     end
 
     Format --> V1 --> V2 --> V3 --> PDF & DOCX_R --> V4 --> V5
-    V5 --> A1 --> A2 --> A3 --> A4 --> A5 --> DOCX_W
-    A3 --> Rules
+    V5 --> A1 --> A2 --> A4 --> A5 --> DOCX_W
+    A4 --> Rules
     DOCX_W -->|"outputs/*.docx"| Download
 ```
 
@@ -73,6 +74,8 @@ graph TB
 ## Agent Pipeline
 
 The pipeline is a **sequential CrewAI `Crew`** — each agent receives context from prior agents via `Task.context`. All agents use `temperature=0` for deterministic output. All JSON is extracted using `extract_json_from_llm()` which handles markdown fences, Python literals, trailing commas, and single quotes.
+
+Before the pipeline runs, `_build_structured_paper()` uses `text_chunker.split_into_sections()` to pre-label the paper with IMRAD section delimiters (`[SECTION: NAME]` markers). This gives the Ingest agent a structurally clear document without truncating any content.
 
 ### Agent 1 — INGEST
 
@@ -125,24 +128,25 @@ The pipeline is a **sequential CrewAI `Crew`** — each agent receives context f
 
 ---
 
-### Agent 3 — INTERPRET
+### Agent 3 — TRANSFORM
 
-**Goal**: Load and return the target journal's formatting rules JSON verbatim. Uses `_RULE_ENGINE_CACHE` for in-memory rule caching across requests.
+**Goal**: Two-phase processing — Phase A scans violations inline, Phase B applies fixes and produces `docx_instructions`. Rules are loaded from `rules/*.json` and injected as part of the task description.
 
-**Input**: Journal name (e.g., `"APA 7th Edition"`)
-**Output**: Full `rules/*.json` content as JSON
+**Phase A — violation scan** (run first):
+Checks abstract word count, heading case, citation format, reference ordering, figure/table caption positions.
 
----
-
-### Agent 4 — TRANSFORM
-
-**Goal**: Compare paper structure against journal rules, identify violations, apply fixes, produce `docx_instructions`.
+**Phase B — transformation**:
+Produces `docx_instructions` with VERBATIM content from the original paper.
 
 **Output schema**:
 ```json
 {
-  "violations": ["Citation format incorrect — expected (Author, Year)"],
-  "changes_made": ["Reformatted 14 citations to APA format"],
+  "violations": [
+    { "rule_category": "citations", "rule_description": "...", "rule_reference": "APA 7th §8.11", "violation_found": "...", "fix_applied": "..." }
+  ],
+  "changes_made": [
+    { "what": "Reformatted 14 citations to APA format", "rule_reference": "APA 7th §8.11", "why": "Required by APA 7th §8.11" }
+  ],
   "docx_instructions": {
     "rules": {},
     "sections": [
@@ -161,9 +165,13 @@ The pipeline is a **sequential CrewAI `Crew`** — each agent receives context f
 
 Applies `_sort_sections_by_canonical_order()` (IMRAD ordering: Introduction → Methods → Results → Discussion) and `_normalize_citation()` for citation style normalization.
 
+**DOCX output paths:**
+- **DOCX input**: `transform_docx_in_place()` — opens original DOCX and applies formatting in-place, preserving figures/tables/equations.
+- **PDF/TXT input**: `write_formatted_docx()` — rebuilds from extracted text (8A verbatim guard + 8B schema validation applied first).
+
 ---
 
-### Agent 5 — VALIDATE
+### Agent 4 — VALIDATE
 
 **Goal**: Run 7 mandatory compliance checks and produce a `compliance_report` with per-section scores 0-100.
 
@@ -180,6 +188,46 @@ Applies `_sort_sections_by_canonical_order()` (IMRAD ordering: Introduction → 
 
 ---
 
+## Reliability Features (8A/8B/8C)
+
+### 8A — Verbatim Content Guard
+
+Applies to the PDF/TXT rebuild path (`write_formatted_docx`) only. DOCX in-place path is already verbatim by design.
+
+- **Pass 1**: Filters empty/null-content sections (prevents blank paragraphs in output)
+- **Pass 2**: If abstract content is < 100 chars after LLM processing, restores it from the original extracted text via `split_into_sections()`
+
+```python
+def _guard_section_contents(sections: list, paper_content: Optional[str]) -> list
+```
+
+### 8B — Response Schema Validation
+
+Before any DOCX write, `docx_instructions` is validated against `DOCX_INSTRUCTIONS_SCHEMA` using `jsonschema`. Raises `TransformError` with a human-readable message on violation — catches LLM schema drift before it causes a cryptic `KeyError`.
+
+```python
+def _validate_docx_instructions(docx_instructions: dict) -> None
+```
+
+Non-blocking if `jsonschema` is unavailable (logs warning, continues).
+
+### 8C — Async Processing for Large Files
+
+Files >500KB are routed to `FastAPI.BackgroundTasks` to avoid HTTP timeouts:
+
+1. `/format` extracts text synchronously, then returns HTTP 202 with `{job_id, poll_url}`
+2. `_run_pipeline_job()` runs `run_pipeline()` in the background, writes result to `JOB_STORE[job_id]`
+3. Frontend polls `GET /status/{job_id}` every 4 seconds until `status === "done"`
+
+```python
+ASYNC_THRESHOLD = 500_000  # bytes — files above this go async
+JOB_STORE: dict = {}       # in-memory job store keyed by job_id
+```
+
+**Limitation**: Large DOCX files processed async use the text-rebuild path (figures not preserved) because the temp upload file is deleted before the background task runs.
+
+---
+
 ## Directory Structure
 
 ```
@@ -189,8 +237,7 @@ backend/
 │   ├── __init__.py              # Exports create_*_agent() for all 5 agents
 │   ├── ingest_agent.py          # create_ingest_agent(llm) → Agent
 │   ├── parse_agent.py           # create_parse_agent(llm) → Agent
-│   ├── interpret_agent.py       # create_interpret_agent(llm) → Agent
-│   ├── transform_agent.py       # create_transform_agent(llm) → Agent
+│   ├── transform_agent.py       # create_transform_agent(llm) → Agent (Phase A + B)
 │   └── validate_agent.py        # create_validate_agent(llm) → Agent
 │
 ├── engine/
@@ -199,8 +246,11 @@ backend/
 ├── tools/
 │   ├── pdf_reader.py            # extract_pdf_text(path) → str
 │   ├── docx_reader.py           # extract_docx_text(path) → str
-│   ├── docx_writer.py           # write_formatted_docx(instructions, path)
+│   ├── docx_writer.py           # write_formatted_docx() + transform_docx_in_place()
 │   ├── rule_loader.py           # load_rules(journal), JOURNAL_MAP, get_supported_journals()
+│   ├── text_chunker.py          # split_into_sections() → IMRAD sections + word counts
+│   ├── compliance_checker.py    # run_deterministic_checks() + apply_deterministic_checks()
+│   ├── rule_extractor.py        # extract_journal_rules_from_url() (BeautifulSoup)
 │   ├── logger.py                # get_logger(name) → logging.Logger (structured format)
 │   └── tool_errors.py           # ToolError, ParseError, LLMResponseError, TransformError,
 │                                #   ValidationError, DocumentWriteError, RuleLoadError
@@ -249,6 +299,17 @@ backend/
 
 ## API Reference
 
+### Endpoints Summary
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | System status + supported journals |
+| `POST` | `/format` | Upload paper → run pipeline (sync or async) |
+| `GET` | `/download/{filename}` | Download generated DOCX |
+| `GET` | `/status/{job_id}` | Poll async job status (large files >500KB) |
+
+---
+
 ### GET /health
 
 Returns system status, supported journals, and diagnostics.
@@ -288,14 +349,17 @@ Upload and format a research paper.
 | `file` | File | Yes | PDF or DOCX, max 10 MB |
 | `journal` | String | Yes | Must match `JOURNAL_MAP` key |
 
-**Response 200:**
+**Sync response 200** (files <500KB):
 ```json
 {
   "success": true,
   "request_id": "3193503d",
   "download_url": "/download/formatted_3193503d.docx",
   "compliance_report": { ... },
-  "changes_made": ["list of human-readable fix descriptions"],
+  "changes_made": [
+    { "what": "...", "rule_reference": "APA 7th §8.11", "why": "Required by APA 7th §8.11" }
+  ],
+  "interpretation_results": { "violations": [...], "total_violations": 3, "journal": "APA 7th Edition" },
   "processing_time_seconds": 47.3,
   "output_metadata": {
     "filename": "formatted_3193503d.docx",
@@ -322,6 +386,34 @@ Upload and format a research paper.
   "error": "Human-readable error message",
   "step": "validation | extraction | parse | interpret | transform | validate | llm | docx_writer"
 }
+```
+
+---
+
+**Async response 202** (files >500KB):
+```json
+{
+  "success": true,
+  "async": true,
+  "job_id": "3193503d",
+  "status": "processing",
+  "poll_url": "/status/3193503d"
+}
+```
+
+---
+
+### GET /status/{job_id}
+
+Poll async background job status.
+
+**Path param**: `job_id` — 8-char hex, validated as `^[a-f0-9]{8}$`.
+
+**Responses:**
+```json
+{ "status": "processing" }
+{ "status": "done", "result": { ...same shape as /format 200... } }
+{ "status": "error", "error": "Pipeline error message" }
 ```
 
 ---
@@ -378,7 +470,7 @@ cp .env.example .env
 |----------|----------|---------|-------------|
 | `GEMINI_API_KEY` | Yes | — | Google Gemini API key |
 | `GOOGLE_API_KEY` | Yes | — | Same key (LiteLLM reads this alias) |
-| `GEMINI_MODEL` | No | `gemini-2.0-flash` | Gemini model identifier |
+| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Gemini model identifier |
 | `GEMINI_MAX_TOKENS` | No | `4096` | Max tokens per LLM call |
 | `CORS_ORIGINS` | No | `http://localhost:5173,http://localhost:3000` | Comma-separated allowed CORS origins |
 | `BACKEND_HOST` | No | `0.0.0.0` | Uvicorn bind host |
@@ -552,6 +644,16 @@ Each `rules/*.json` file follows this structure:
 ---
 
 ## Performance & Caching
+
+### Async Processing (8C)
+
+Files >500KB are processed as background jobs. Text is extracted synchronously before the job starts — the temp file is deleted when the HTTP response is sent.
+
+```python
+ASYNC_THRESHOLD = 500_000  # bytes
+```
+
+Frontend polls `/status/{job_id}` every 4 seconds (max 150 polls / 10 minutes).
 
 ### Pipeline Cache
 

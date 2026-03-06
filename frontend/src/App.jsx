@@ -6,6 +6,7 @@ import ProcessingLoader from "./components/ProcessingLoader.jsx";
 import ComplianceScore from "./components/ComplianceScore.jsx";
 import ChangesList from "./components/ChangesList.jsx";
 import IMRADCheck from "./components/IMRADCheck.jsx";
+import ViolationsDetected from "./components/ViolationsDetected.jsx";
 
 // Vite proxy handles /health, /format, /download → backend at localhost:8000
 const FORMAT_TIMEOUT_MS = 0; // 0 = no timeout — pipeline can take as long as needed
@@ -66,6 +67,22 @@ export default function App() {
       }
     }, stepTimings[stepIndex] || 10000);
 
+    // Poll /status/{job_id} until the background job completes
+    const pollJobStatus = async (pollUrl) => {
+      const POLL_INTERVAL_MS = 4000;
+      const MAX_POLLS = 150; // 10 minutes max
+      for (let i = 0; i < MAX_POLLS; i++) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        const res = await axios.get(pollUrl);
+        if (res.data.status === "done") return res.data.result;
+        if (res.data.status === "error") {
+          throw new Error(res.data.error || "Background processing failed.");
+        }
+        // status === "processing" → keep polling
+      }
+      throw new Error("Job timed out after 10 minutes. Please try again.");
+    };
+
     try {
       const formData = new FormData();
       formData.append("file", file);
@@ -77,7 +94,14 @@ export default function App() {
       });
 
       clearInterval(stepInterval);
-      setResult(response.data);
+
+      // 8C: Large file — response has job_id, poll until complete
+      let resultData = response.data;
+      if (resultData.job_id && resultData.poll_url) {
+        resultData = await pollJobStatus(resultData.poll_url);
+      }
+
+      setResult(resultData);
       setAppState("success");
     } catch (err) {
       clearInterval(stepInterval);
@@ -227,6 +251,7 @@ export default function App() {
               result={result}
               complianceReport={compliance_report}
               changesMade={changes_made}
+              interpretationResults={result?.interpretation_results}
               onDownload={handleDownload}
               onReset={handleReset}
             />
@@ -275,7 +300,7 @@ function ErrorDisplay({ error, onRetry }) {
 // ---------------------------------------------------------------------------
 // SuccessView — inline, one-off component
 // ---------------------------------------------------------------------------
-function SuccessView({ result, complianceReport, changesMade, onDownload, onReset }) {
+function SuccessView({ result, complianceReport, changesMade, interpretationResults, onDownload, onReset }) {
   return (
     <>
       {/* Download Banner */}
@@ -309,6 +334,11 @@ function SuccessView({ result, complianceReport, changesMade, onDownload, onRese
 
       {/* Compliance Score Dashboard */}
       <ComplianceScore report={complianceReport} />
+
+      {/* Violations Detected — Interpret phase output surfaced from merged Transform */}
+      {interpretationResults?.violations?.length > 0 && (
+        <ViolationsDetected data={interpretationResults} />
+      )}
 
       {/* IMRAD Structure Check */}
       {complianceReport?.imrad_check && (

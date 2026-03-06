@@ -5,18 +5,22 @@ import re
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
+
+from tools.text_chunker import split_into_sections
 
 from crewai import Crew, Process, Task
 from dotenv import load_dotenv
 
 from agents import (
     create_ingest_agent,
-    create_interpret_agent,
     create_parse_agent,
     create_transform_agent,
     create_validate_agent,
 )
-from tools.docx_writer import write_formatted_docx
+from agents.validate_agent import SECTION_WEIGHTS
+from tools.compliance_checker import apply_deterministic_checks, run_deterministic_checks
+from tools.docx_writer import transform_docx_in_place, write_formatted_docx
 from tools.logger import get_logger
 from tools.rule_loader import load_rules
 from tools.tool_errors import (
@@ -33,24 +37,412 @@ logger = get_logger(__name__)
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Truncation constants — 24K body + 8K tail (references) per spec
-MAX_CHARS = 32_000
-HEAD_CHARS = 24_000
-TAIL_CHARS = 8_000
-TRUNCATION_MARKER = (
-    "\n\n[... CONTENT TRUNCATED FOR PROCESSING — REFERENCES SECTION BELOW ...]\n\n"
-)
 
 # In-memory pipeline cache: identical (paper, journal) pairs return instantly
 PIPELINE_CACHE: dict = {}
 
-_STEP_NAMES = ["INGEST", "PARSE", "INTERPRET", "TRANSFORM", "VALIDATE"]
+_STEP_NAMES = ["INGEST", "PARSE", "TRANSFORM", "VALIDATE"]
+
+# Rule reference lookup — keyed by journal (first word, lowercase) → topic → section ref
+# Used to enrich changes_made entries with authoritative rule citations for judge visibility.
+RULE_REFERENCES: dict[str, dict[str, str]] = {
+    "apa": {
+        "abstract":           "APA 7th §2.9",
+        "abstract_word":      "APA 7th §2.9",
+        "heading":            "APA 7th §2.27",
+        "headings":           "APA 7th §2.27",
+        "citation":           "APA 7th §8.11",
+        "citations":          "APA 7th §8.11",
+        "in_text_citation":   "APA 7th §8.11",
+        "et_al":              "APA 7th §8.17",
+        "reference":          "APA 7th §9.4",
+        "references":         "APA 7th §9.4",
+        "hanging_indent":     "APA 7th §9.43",
+        "doi":                "APA 7th §9.34",
+        "title_page":         "APA 7th §2.3",
+        "font":               "APA 7th §2.19",
+        "document_format":    "APA 7th §2.19",
+        "line_spacing":       "APA 7th §2.21",
+        "margins":            "APA 7th §2.22",
+        "figures":            "APA 7th §7.22",
+        "tables":             "APA 7th §7.4",
+        "keywords":           "APA 7th §2.13",
+    },
+    "ieee": {
+        "abstract":           "IEEE Style §II",
+        "heading":            "IEEE Style §II-A",
+        "headings":           "IEEE Style §II-A",
+        "citation":           "IEEE Ref Guide §III",
+        "citations":          "IEEE Ref Guide §III",
+        "in_text_citation":   "IEEE Ref Guide §III",
+        "et_al":              "IEEE Ref Guide §II",
+        "reference":          "IEEE Ref Guide §V",
+        "references":         "IEEE Ref Guide §V",
+        "figures":            "IEEE Style §IV",
+        "tables":             "IEEE Style §III-B",
+        "font":               "IEEE Style §I",
+        "document_format":    "IEEE Style §I",
+        "line_spacing":       "IEEE Style §I",
+        "margins":            "IEEE Style §I",
+        "keywords":           "IEEE Style §II",
+    },
+    "vancouver": {
+        "abstract":           "Vancouver §2",
+        "heading":            "Vancouver §3",
+        "headings":           "Vancouver §3",
+        "citation":           "Vancouver §6",
+        "citations":          "Vancouver §6",
+        "in_text_citation":   "Vancouver §6",
+        "et_al":              "Vancouver §6.2",
+        "reference":          "Vancouver §7",
+        "references":         "Vancouver §7",
+        "figures":            "Vancouver §4",
+        "tables":             "Vancouver §5",
+        "font":               "Vancouver §1",
+        "document_format":    "Vancouver §1",
+        "line_spacing":       "Vancouver §1",
+        "margins":            "Vancouver §1",
+        "keywords":           "Vancouver §2",
+    },
+    "springer": {
+        "abstract":           "Springer §2.1",
+        "heading":            "Springer §2.3",
+        "headings":           "Springer §2.3",
+        "citation":           "Springer §3.1",
+        "citations":          "Springer §3.1",
+        "in_text_citation":   "Springer §3.1",
+        "et_al":              "Springer §3.1",
+        "reference":          "Springer §3.2",
+        "references":         "Springer §3.2",
+        "figures":            "Springer §4.1",
+        "tables":             "Springer §4.2",
+        "font":               "Springer §2.6",
+        "document_format":    "Springer §2.6",
+        "line_spacing":       "Springer §2.6",
+        "margins":            "Springer §2.6",
+        "keywords":           "Springer §2.2",
+    },
+    "chicago": {
+        "abstract":           "Chicago 17th §A.2",
+        "heading":            "Chicago 17th §A.1",
+        "headings":           "Chicago 17th §A.1",
+        "citation":           "Chicago 17th §15.2",
+        "citations":          "Chicago 17th §15.2",
+        "in_text_citation":   "Chicago 17th §15.2",
+        "et_al":              "Chicago 17th §15.28",
+        "reference":          "Chicago 17th §14.1",
+        "references":         "Chicago 17th §14.1",
+        "hanging_indent":     "Chicago 17th §14.22",
+        "figures":            "Chicago 17th §3.14",
+        "tables":             "Chicago 17th §3.51",
+        "font":               "Chicago 17th §A.1",
+        "document_format":    "Chicago 17th §A.1",
+        "line_spacing":       "Chicago 17th §A.1",
+        "margins":            "Chicago 17th §A.1",
+        "keywords":           "Chicago 17th §A.2",
+    },
+}
+
+# Keyword → rule topic mapping for enriching plain-string changes_made entries
+_CHANGE_KEYWORD_MAP: list[tuple[list[str], str]] = [
+    (["abstract", "word count", "word limit", "words over"], "abstract"),
+    (["heading", "h1", "h2", "h3", "title case", "uppercase", "sentence case", "bold"], "headings"),
+    (["citation", "in-text", "in_text", "author-date", "numbered citation", "cite"], "citations"),
+    (["et al"], "et_al"),
+    (["reference", "bibliography", "hanging indent", "alphabetical", "sorted ref"], "references"),
+    (["doi", "url", "link", "https"], "doi"),
+    (["figure", "fig.", "caption below", "caption above"], "figures"),
+    (["table", "tbl."], "tables"),
+    (["font", "times new roman", "arial", "calibri", "typeface", "serif"], "font"),
+    (["line spacing", "double space", "single space", "spacing"], "line_spacing"),
+    (["margin", "page size", "page layout"], "margins"),
+    (["keyword", "key word", "index term"], "keywords"),
+]
+
+
+def _enrich_changes_made(changes: list, journal_style: str) -> list[dict]:
+    """
+    Enrich changes_made entries with authoritative rule references.
+
+    Accepts either:
+      - Structured dicts {what, rule_reference, why} — LLM returned structured output
+      - Plain strings — keyword-matched to assign rule_reference from RULE_REFERENCES
+
+    Returns a list of {what, rule_reference, why} dicts, always.
+    Empty or non-list input returns an empty list.
+    """
+    if not isinstance(changes, list):
+        return []
+
+    # Extract journal key: "APA 7th Edition" → "apa", "Chicago 17th Edition" → "chicago"
+    journal_key = journal_style.lower().split()[0]
+    refs = RULE_REFERENCES.get(journal_key, {})
+
+    enriched: list[dict] = []
+    for change in changes:
+        if isinstance(change, dict):
+            # Already structured — fill in any missing fields
+            what = change.get("what") or change.get("description") or str(change)
+            ref  = change.get("rule_reference") or ""
+            if not ref:
+                # Try keyword match on the 'what' field
+                ref = _keyword_match_ref(what, refs)
+            why = change.get("why") or f"Required by {ref}"
+            enriched.append({"what": what, "rule_reference": ref, "why": why})
+        elif isinstance(change, str) and change.strip():
+            ref = _keyword_match_ref(change, refs)
+            enriched.append({
+                "what": change,
+                "rule_reference": ref,
+                "why": f"Required by {ref}",
+            })
+
+    return enriched
+
+
+def _keyword_match_ref(text: str, refs: dict) -> str:
+    """Return a rule reference string by keyword-matching against a journal's refs dict."""
+    lower = text.lower()
+    for keywords, topic in _CHANGE_KEYWORD_MAP:
+        if any(kw in lower for kw in keywords):
+            if topic in refs:
+                return refs[topic]
+    return "Journal guidelines"
+
+
+# ── 8B: Response schema validation ────────────────────────────────────────────
+DOCX_INSTRUCTIONS_SCHEMA = {
+    "type": "object",
+    "required": ["sections"],
+    "properties": {
+        "sections": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["type", "content"],
+                "properties": {
+                    "type": {"type": "string"},
+                    "content": {"type": ["string", "null"]},
+                },
+            },
+        },
+    },
+}
+
+
+def _validate_docx_instructions(docx_instructions: dict) -> None:
+    """
+    Validate docx_instructions schema using jsonschema before DOCX write.
+
+    Raises TransformError with a human-readable message on violation.
+    Non-blocking if jsonschema is unavailable.
+    """
+    try:
+        import jsonschema
+        jsonschema.validate(instance=docx_instructions, schema=DOCX_INSTRUCTIONS_SCHEMA)
+        logger.debug("[DOCX_VALID] docx_instructions schema OK — %d sections",
+                     len(docx_instructions.get("sections", [])))
+    except ImportError:
+        logger.warning("[DOCX_VALID] jsonschema not installed — skipping schema validation")
+    except Exception as e:
+        msg = e.message if hasattr(e, "message") else str(e)
+        raise TransformError(
+            f"docx_instructions failed schema validation: {msg}. "
+            "Transform agent returned malformed output."
+        )
+
+
+# ── 8A: Verbatim content guard ─────────────────────────────────────────────────
+def _guard_section_contents(sections: list, paper_content: Optional[str]) -> list:
+    """
+    Verbatim content guard for the PDF/TXT DOCX rebuild path.
+
+    Pass 1 — filters empty/null content sections (prevents blank paragraphs).
+    Pass 2 — restores abstract from original paper text if LLM truncated it.
+
+    Never raises — all failures are logged as warnings.
+    """
+    # Pass 1: Remove empty sections
+    cleaned = [s for s in sections if s.get("content") and str(s["content"]).strip()]
+    removed = len(sections) - len(cleaned)
+    if removed:
+        logger.info("[DOCX_GUARD] Filtered %d empty/null sections", removed)
+
+    if not paper_content:
+        return cleaned
+
+    # Pass 2: Restore truncated abstract from original text
+    try:
+        orig_sections = split_into_sections(paper_content)
+        orig_map = {sec.name.lower(): sec.text for sec in orig_sections}
+
+        for section in cleaned:
+            sec_type = str(section.get("type", "")).lower()
+            content = str(section.get("content", ""))
+            if sec_type == "abstract" and len(content.strip()) < 100:
+                original_abstract = orig_map.get("abstract", "")
+                if len(original_abstract) > len(content):
+                    section["content"] = original_abstract
+                    logger.info(
+                        "[DOCX_GUARD] Abstract restored from original (%d → %d chars)",
+                        len(content), len(original_abstract),
+                    )
+    except Exception as _e:
+        logger.warning("[DOCX_GUARD] Content guard pass 2 failed (non-fatal): %s", _e)
+
+    return cleaned
 
 
 def _hash_content(paper_text: str, journal: str) -> str:
     """SHA-256 fingerprint of (paper_text + journal) for cache keying."""
     payload = f"{journal}::{paper_text}"
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _build_structured_paper(paper_content: str) -> tuple[str, dict]:
+    """
+    Pre-label the paper with IMRAD section delimiters so agents understand
+    document structure without guessing.
+
+    Uses text_chunker.split_into_sections() to detect boundaries in Python,
+    then injects clear section header markers. No content is removed or
+    truncated — structure is ADDED, not subtracted.
+
+    Returns:
+        (structured_text, section_stats) where section_stats maps section
+        name → {word_count, char_count} for injecting into agent prompts.
+    """
+    sections = split_into_sections(paper_content)
+    if len(sections) <= 1:
+        # No section headers detected — return as-is (short papers, abstracts only, etc.)
+        return paper_content, {}
+
+    parts: list[str] = []
+    stats: dict = {}
+
+    for sec in sections:
+        stats[sec.name] = {
+            "word_count": len(sec.text.split()),
+            "char_count":  sec.chars,
+        }
+        if sec.name == "preamble":
+            parts.append(sec.text)
+        else:
+            label = f"\n{'=' * 60}\n[SECTION: {sec.raw_name.upper()}]\n{'=' * 60}"
+            parts.append(f"{label}\n{sec.text}")
+
+    structured = "\n\n".join(parts)
+    logger.debug(
+        "[PIPELINE] Paper pre-structured — %d sections: %s | total chars: %d",
+        len(sections), list(stats.keys()), len(structured),
+    )
+    return structured, stats
+
+
+def _build_section_rules_guide(rules: dict, section_stats: dict) -> str:
+    """
+    Build a compact, section-by-section formatting guide for the transform agent.
+
+    Maps each IMRAD section type to its specific journal rules + detected stats.
+    This gives the transform agent precise, actionable instructions per section
+    instead of a flat rules blob, dramatically improving per-section accuracy.
+
+    Returns a human-readable multi-line string injected into the transform task.
+    """
+    lines: list[str] = ["=== SECTION-BY-SECTION FORMATTING GUIDE ===", ""]
+
+    # ── Abstract ──────────────────────────────────────────────────────────────
+    abs_rules = rules.get("abstract", {})
+    abs_stat  = section_stats.get("abstract", {})
+    abs_words = abs_stat.get("word_count", "?")
+    abs_limit = abs_rules.get("max_words")
+    if isinstance(abs_words, int) and isinstance(abs_limit, int) and abs_words > abs_limit:
+        abs_status = f"⚠ OVER LIMIT BY {abs_words - abs_limit} WORDS — TRIM REQUIRED"
+    else:
+        abs_status = f"✓ within limit ({abs_words}/{abs_limit or '?'} words)"
+    lines += [
+        f"[ABSTRACT]  {abs_status}",
+        f"  limit: {abs_limit or 'not specified'} words",
+    ]
+    if abs_rules.get("structured"):
+        lines.append("  structured abstract required: Background / Objective / Methods / Results / Conclusion")
+    if abs_rules.get("keywords_required"):
+        lines.append(f"  keywords: required — max {abs_rules.get('max_keywords', '?')} terms")
+    lines.append("")
+
+    # ── Headings ──────────────────────────────────────────────────────────────
+    h_rules = rules.get("headings", {})
+    lines.append("[HEADINGS]  — apply case/style to EVERY heading in the document")
+    for level in ["H1", "H2", "H3"]:
+        h = h_rules.get(level, {})
+        if h:
+            lines.append(
+                f"  {level}: case={h.get('case', '?')!r}  "
+                f"bold={h.get('bold', '?')}  "
+                f"italic={h.get('italic', False)}  "
+                f"centered={h.get('centered', False)}  "
+                f"font_size={h.get('font_size', 'inherit')}pt"
+            )
+    lines.append("")
+
+    # ── In-text citations ─────────────────────────────────────────────────────
+    cit_rules = rules.get("citations", {})
+    lines += [
+        "[IN-TEXT CITATIONS]",
+        f"  format: {cit_rules.get('format', '?')}  "
+        f"(numbered = [1], [2] style  |  author_date = (Smith, 2020) style)",
+        f"  et_al_threshold: {cit_rules.get('et_al_threshold', '?')} authors",
+    ]
+    if cit_rules.get("ibid_allowed") is not None:
+        lines.append(f"  ibid allowed: {cit_rules.get('ibid_allowed')}")
+    lines.append("")
+
+    # ── References list ───────────────────────────────────────────────────────
+    ref_rules = rules.get("references", {})
+    ref_stat  = section_stats.get("references", section_stats.get("bibliography", {}))
+    lines += [
+        "[REFERENCES LIST]",
+        f"  ordering: {ref_rules.get('ordering', 'alphabetical')}",
+        f"  style: {ref_rules.get('style', '?')}",
+        f"  detected section size: {ref_stat.get('word_count', '?')} words",
+    ]
+    lines.append("")
+
+    # ── Document / page format ────────────────────────────────────────────────
+    doc_rules = rules.get("document", {})
+    margins   = doc_rules.get("margins", {})
+    lines += [
+        "[DOCUMENT FORMAT  — apply to ALL body paragraphs]",
+        f"  font: {doc_rules.get('font', '?')}",
+        f"  font_size: {doc_rules.get('font_size', '?')}pt",
+        f"  line_spacing: {doc_rules.get('line_spacing', '?')}",
+        f"  margins (inches):  "
+        f"top={margins.get('top', '?')}  "
+        f"bottom={margins.get('bottom', '?')}  "
+        f"left={margins.get('left', '?')}  "
+        f"right={margins.get('right', '?')}",
+    ]
+    lines.append("")
+
+    # ── Figures & Tables ──────────────────────────────────────────────────────
+    fig_rules = rules.get("figures", {})
+    tbl_rules = rules.get("tables", {})
+    lines.append("[FIGURES & TABLES]")
+    if fig_rules.get("caption_position"):
+        lines.append(
+            f"  figure caption: {fig_rules['caption_position']} figure  |  "
+            f"format: {fig_rules.get('caption_format', '?')}"
+        )
+    if tbl_rules.get("caption_position"):
+        lines.append(
+            f"  table caption: {tbl_rules['caption_position']} table  |  "
+            f"format: {tbl_rules.get('caption_format', '?')}"
+        )
+    lines.append("")
+    lines.append("=== END OF SECTION GUIDE — apply each section's rules precisely ===")
+
+    return "\n".join(lines)
 
 
 def _extract_first_json_block(text: str) -> str | None:
@@ -160,22 +552,6 @@ def extract_json_from_llm(raw: str) -> dict:
         )
 
 
-def _truncate_paper(content: str) -> str:
-    """
-    Truncate large papers to stay within LLM context limits.
-    Takes first 24K chars (body) + last 8K chars (references).
-    Returns original content unchanged if under MAX_CHARS.
-    """
-    if len(content) <= MAX_CHARS:
-        return content
-
-    logger.warning(
-        "[PIPELINE] Paper content truncated: %d chars → %d chars (head=%d, tail=%d)",
-        len(content), MAX_CHARS, HEAD_CHARS, TAIL_CHARS,
-    )
-    head = content[:HEAD_CHARS]
-    tail = content[-TAIL_CHARS:]
-    return head + TRUNCATION_MARKER + tail
 
 
 class _StepTimer:
@@ -195,7 +571,7 @@ class _StepTimer:
         )
         self.stage_times[name.lower()] = elapsed
         logger.info(
-            "[PIPELINE] Step %d/5 — %-10s completed in %.2fs",
+            "[PIPELINE] Step %d/4 — %-10s completed in %.2fs",
             self._step_index + 1, name, elapsed,
         )
         self._step_index += 1
@@ -212,9 +588,8 @@ def _validate_task_outputs(crew: Crew) -> None:
     validations = [
         (0, "ingest",    lambda o: bool(o and o.strip())),
         (1, "parse",     lambda o: '"sections"' in o or "'sections'" in o),
-        (2, "interpret", lambda o: bool(o and len(o.strip()) > 10)),
-        (3, "transform", lambda o: '"docx_instructions"' in o or "'docx_instructions'" in o),
-        (4, "validate",  lambda o: '"overall_score"' in o or "'overall_score'" in o),
+        (2, "transform", lambda o: '"docx_instructions"' in o or "'docx_instructions'" in o),
+        (3, "validate",  lambda o: '"overall_score"' in o or "'overall_score'" in o),
     ]
     for idx, name, check in validations:
         try:
@@ -230,7 +605,7 @@ def _validate_task_outputs(crew: Crew) -> None:
         logger.debug("[PIPELINE] Task '%s' output validated OK (%d chars)", name, len(raw))
 
 
-def run_pipeline(paper_content: str, journal_style: str) -> dict:
+def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optional[str] = None) -> dict:
     """
     Execute the 5-agent CrewAI sequential pipeline.
 
@@ -265,10 +640,6 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
     if not journal_style or not journal_style.strip():
         raise ParseError("Journal style cannot be empty.")
 
-    original_len = len(paper_content)
-    paper_content = _truncate_paper(paper_content)
-    truncated = len(paper_content) < original_len
-
     # ── Improvement 7: Cache check — return instantly for identical submissions ──
     cache_key = _hash_content(paper_content, journal_style)
     if cache_key in PIPELINE_CACHE:
@@ -279,10 +650,8 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
         return PIPELINE_CACHE[cache_key]
 
     logger.info(
-        "[PIPELINE] Starting — journal=%s chars=%d%s cache_miss=%s",
-        journal_style, len(paper_content),
-        f" (truncated from {original_len})" if truncated else "",
-        cache_key[:12],
+        "[PIPELINE] Starting — journal=%s chars=%d cache_miss=%s",
+        journal_style, len(paper_content), cache_key[:12],
     )
     pipeline_start = time.time()
 
@@ -297,22 +666,33 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
     rules = load_rules(journal_style)
     logger.info("[PIPELINE] Rules loaded — %d sections", len(rules))
 
-    logger.info("[PIPELINE] Initialising 5 agents...")
+    # ── Section-aware context building ───────────────────────────────────────
+    # Pre-label the paper with IMRAD section delimiters (no truncation — only adds structure).
+    # This gives INGEST a structurally clear document, dramatically improving
+    # per-section label accuracy and downstream agent precision.
+    structured_paper, section_stats = _build_structured_paper(paper_content)
+    section_rules_guide = _build_section_rules_guide(rules, section_stats)
+    logger.info(
+        "[PIPELINE] Section-aware context built — %d sections detected: %s",
+        len(section_stats), list(section_stats.keys()),
+    )
+
+    logger.info("[PIPELINE] Initialising 4 agents (interpret merged into transform)...")
     ingest_agent = create_ingest_agent(llm)
     parse_agent = create_parse_agent(llm)
-    interpret_agent = create_interpret_agent(llm)
     transform_agent = create_transform_agent(llm)
     validate_agent = create_validate_agent(llm)
     logger.info("[PIPELINE] Agents ready")
 
     ingest_task = Task(
         description=(
-            f"You have received the raw text of a research paper. "
-            f"Label every content block with its type marker "
+            f"You have received the text of a research paper. "
+            f"The paper has been pre-segmented by section (look for [SECTION: NAME] markers). "
+            f"Label every content block within each section with its type marker "
             f"(TITLE, ABSTRACT, KEYWORD, HEADING_H1, HEADING_H2, HEADING_H3, "
             f"BODY_PARAGRAPH, IN_TEXT_CITATION, FIGURE_CAPTION, TABLE_CAPTION, "
-            f"REFERENCE_ENTRY). Return the labelled content.\n\n"
-            f"--- RAW PAPER CONTENT ---\n{paper_content}"
+            f"REFERENCE_ENTRY). Preserve the section markers — they guide the downstream agents.\n\n"
+            f"--- PAPER CONTENT (pre-segmented by section) ---\n{structured_paper}"
         ),
         expected_output=(
             "Labelled document content with each block prefixed by its type marker. "
@@ -341,44 +721,105 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
         context=[ingest_task],
     )
 
-    interpret_task = Task(
-        description=(
-            f"The target journal is: {journal_style}\n\n"
-            f"Load and return the complete formatting rules for this journal. "
-            f"The rules are already loaded — return the following JSON exactly:\n"
-            f"{json.dumps(rules, indent=2)}\n\n"
-            f"Return ONLY valid JSON — no markdown fences, no explanation."
-        ),
-        expected_output=(
-            "Valid JSON object containing the complete journal formatting rules. "
-            "Must include: document, abstract, headings, citations, references, "
-            "figures, tables sections."
-        ),
-        agent=interpret_agent,
+    # ── Section stats summary for inject into transform task ──────────────────
+    _section_stats_text = (
+        "".join(
+            f"   {name}: {stat['word_count']} words\n"
+            for name, stat in section_stats.items()
+        ) or "   (no sections detected — paper may lack standard headers)\n"
     )
 
     transform_task = Task(
         description=(
-            "You have the paper_structure (from parse step) and the journal rules "
-            "(from interpret step). "
-            "Compare every paper element against the journal rules. "
-            "Identify all formatting violations. "
-            "Produce the transformation output as JSON with keys: "
-            "violations (list of violation descriptions), "
-            "changes_made (list of human-readable fix descriptions), "
-            "docx_instructions (object with: rules dict, sections list where each "
-            "section has: type, content, and optionally level for headings), "
-            "output_filename (string). "
-            "The sections list must contain ALL paper content in document order. "
-            "Return ONLY valid JSON — no markdown fences, no explanation."
+            f"You are a Manuscript Transformation Engine for {journal_style}.\n\n"
+            f"You have:\n"
+            f"1. The paper_structure JSON — from the parse step (previous context)\n"
+            f"2. Pre-computed section word counts (Python-exact):\n"
+            f"{_section_stats_text}"
+            f"3. A SECTION-BY-SECTION FORMATTING GUIDE — apply each section's rules precisely\n"
+            f"4. The complete journal rules JSON\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"PHASE A — INLINE VIOLATION SCAN (do first):\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Systematically check each rule category against the paper_structure:\n"
+            f"  abstract:   word count vs max_words; structured format required?\n"
+            f"  headings:   case (Title Case / UPPER CASE / Sentence case) correct?\n"
+            f"  citations:  format (numbered/author_date) matches in-text patterns?\n"
+            f"  references: ordering (alphabetical/numbered), et_al threshold met?\n"
+            f"  figures:    caption position and format pattern correct?\n"
+            f"  tables:     caption position and notes format correct?\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"PHASE B — GENERATE TRANSFORMATION INSTRUCTIONS:\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Process each section independently with its specific rules:\n"
+            f"  ABSTRACT: Apply word limit. PRESERVE VERBATIM text — only trim if over limit.\n"
+            f"  HEADINGS: Apply EXACT case transform per H1/H2/H3 rules, bold, italic, centered.\n"
+            f"  BODY PARAGRAPHS: Apply font, font_size, line_spacing.\n"
+            f"  IN-TEXT CITATIONS: Reformat ALL citations to required format.\n"
+            f"  REFERENCES: Sort to correct order, apply style.\n"
+            f"  FIGURES/TABLES: Apply caption position and format pattern.\n\n"
+            f"Output JSON with EXACTLY these top-level keys:\n\n"
+            f"violations: list of objects — one per violation found in PHASE A:\n"
+            f"  {{rule_category, rule_description, rule_reference, violation_found, fix_applied}}\n\n"
+            f"changes_made: list of objects — one per change applied, each:\n"
+            f"  {{\"what\": \"human-readable description of the fix\",\n"
+            f"   \"rule_reference\": \"journal rule section e.g. 'IEEE Ref Guide §III'\",\n"
+            f"   \"why\": \"why this was required e.g. 'Required by IEEE Ref Guide §III'\"}}\n\n"
+            f"docx_instructions: object with:\n"
+            f"  font, font_size, line_spacing, margins (top/bottom/left/right in inches),\n"
+            f"  sections: list of ALL content in document order, each:\n"
+            f"    {{type: HEADING_H1|HEADING_H2|HEADING_H3|BODY_PARAGRAPH|ABSTRACT|\n"
+            f"           FIGURE_CAPTION|TABLE_CAPTION|REFERENCE_ENTRY,\n"
+            f"     content: <VERBATIM original text — do NOT rephrase or paraphrase>,\n"
+            f"     level: 1|2|3 (headings only)}}\n\n"
+            f"citation_replacements: list of {{original, replacement}} for in-text changes\n\n"
+            f"reference_order: list of reference strings in correct journal order\n\n"
+            f"CRITICAL RULE: Every 'content' field MUST be VERBATIM original text.\n"
+            f"Never summarize, paraphrase, or rewrite content — only FORMAT it.\n\n"
+            f"{section_rules_guide}\n\n"
+            f"Full journal rules:\n"
+            f"{json.dumps(rules, indent=2)}\n\n"
+            f"Return ONLY valid JSON — no markdown fences, no explanation."
         ),
         expected_output=(
-            "Valid JSON with violations, changes_made, docx_instructions "
-            "(containing rules and sections list), and output_filename."
+            "Valid JSON with: violations (PHASE A scan results), changes_made (list of strings), "
+            "docx_instructions (font, font_size, line_spacing, margins, sections list with "
+            "type/content/level per block), citation_replacements, reference_order."
         ),
         agent=transform_agent,
-        context=[parse_task, interpret_task],
+        context=[parse_task],
     )
+
+    # --- Deterministic abstract word count (P4) ---
+    # Use section_stats (from text_chunker, Python-exact) as primary source.
+    # Falls back to regex on raw paper_content if section detection missed the abstract.
+    abstract_word_limit: int = rules.get("abstract", {}).get("max_words", 250)
+    abstract_word_count: int = section_stats.get("abstract", {}).get("word_count", 0)
+    abstract_over_limit: bool = False
+
+    if abstract_word_count:
+        abstract_over_limit = abstract_word_count > abstract_word_limit
+        logger.info(
+            "[PIPELINE] Abstract word count (from section_stats): %d / %d — over_limit=%s",
+            abstract_word_count, abstract_word_limit, abstract_over_limit,
+        )
+    else:
+        # Fallback: regex scan of raw paper text
+        try:
+            _abstract_match = re.search(
+                r"(?i)abstract[\s\n:]+(.+?)(?=\n\s*(?:keywords?|introduction|1\.|background))",
+                paper_content,
+                re.DOTALL,
+            )
+            if _abstract_match:
+                abstract_word_count = len(_abstract_match.group(1).split())
+                abstract_over_limit = abstract_word_count > abstract_word_limit
+                logger.info(
+                    "[PIPELINE] Abstract word count (regex fallback): %d / %d — over_limit=%s",
+                    abstract_word_count, abstract_word_limit, abstract_over_limit,
+                )
+        except Exception as _e:
+            logger.warning("[PIPELINE] Abstract word count extraction failed: %s", _e)
 
     validate_task = Task(
         description=(
@@ -391,7 +832,10 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
             "4. Self-citation rate (>30% same author → warning)\n"
             "5. Figure sequential numbering (no gaps)\n"
             "6. Table sequential numbering (no gaps)\n"
-            "7. Abstract word count vs journal limit\n\n"
+            f"7. Abstract word count — VERIFIED BY SYSTEM: abstract contains "
+            f"{abstract_word_count} words, journal limit is {abstract_word_limit} words. "
+            f"Over limit: {abstract_over_limit}. "
+            f"{'Apply -15 to abstract score and add issue.' if abstract_over_limit else 'Abstract is within limit — no deduction.'}\n\n"
             "Return the compliance_report as JSON with keys: "
             "overall_score (0-100), breakdown (7 section scores + issues), "
             "changes_made, imrad_check, citation_consistency, warnings. "
@@ -403,20 +847,20 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
             "citation_consistency, and warnings."
         ),
         agent=validate_agent,
-        context=[transform_task, interpret_task],
+        context=[transform_task],
     )
 
     step_timer = _StepTimer()
 
     crew = Crew(
-        agents=[ingest_agent, parse_agent, interpret_agent, transform_agent, validate_agent],
-        tasks=[ingest_task, parse_task, interpret_task, transform_task, validate_task],
+        agents=[ingest_agent, parse_agent, transform_agent, validate_agent],
+        tasks=[ingest_task, parse_task, transform_task, validate_task],
         process=Process.sequential,
         verbose=True,
         task_callback=step_timer.on_task_complete,
     )
 
-    logger.info("[PIPELINE] Kicking off CrewAI — 5 steps: %s", " → ".join(_STEP_NAMES))
+    logger.info("[PIPELINE] Kicking off CrewAI — 4 steps: %s", " → ".join(_STEP_NAMES))
     result = crew.kickoff()
     raw_output = str(result)
 
@@ -430,12 +874,67 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
     overall_score = compliance_report.get("overall_score", "N/A")
     logger.info("[PIPELINE] Compliance report parsed — overall_score=%s", overall_score)
 
-    logger.info("[PIPELINE] Extracting transform output for DOCX generation...")
-    transform_raw = _get_task_output(crew, task_index=3)
+    # ── Deterministic overrides — replace LLM scores with Python-computed facts ──
+    # Extract paper_structure from parse_task (index 1) to run exact checks.
+    # Any failure here is non-fatal — the LLM scores remain as fallback.
+    try:
+        parse_raw = _get_task_output(crew, task_index=1)
+        paper_structure = extract_json_from_llm(parse_raw)
+        det_checks = run_deterministic_checks(paper_structure, rules)
+        if det_checks:
+            compliance_report = apply_deterministic_checks(
+                compliance_report, det_checks, SECTION_WEIGHTS
+            )
+            overall_score = compliance_report.get("overall_score", overall_score)
+            logger.info(
+                "[PIPELINE] Deterministic checks applied (%d) — final_score=%s",
+                len(det_checks), overall_score,
+            )
+    except Exception as _det_err:
+        logger.warning(
+            "[PIPELINE] Deterministic checks failed (non-fatal — LLM scores kept): %s",
+            _det_err,
+        )
 
-    logger.info("[PIPELINE] Writing formatted DOCX...")
+    logger.info("[PIPELINE] Extracting transform output for DOCX generation...")
+    transform_raw = _get_task_output(crew, task_index=2)
+
+    # ── Extract interpretation results (PHASE A violations) + enriched changes_made ──
+    # The transform agent runs violation scanning inline (PHASE A) then fixes (PHASE B).
+    # Surface violations for the "Interpret" phase and enrich changes_made with rule refs.
+    interpretation_results: dict = {"violations": [], "total_violations": 0}
+    enriched_changes: list[dict] = []
+    try:
+        _transform_data_preview = extract_json_from_llm(transform_raw)
+
+        # Violations (PHASE A)
+        _violations = _transform_data_preview.get("violations", [])
+        if isinstance(_violations, list):
+            interpretation_results = {
+                "violations": _violations,
+                "total_violations": len(_violations),
+                "journal": journal_style,
+            }
+            logger.info(
+                "[PIPELINE] Interpretation results extracted — %d violations surfaced",
+                len(_violations),
+            )
+
+        # Changes made (PHASE B) — enrich with rule references
+        _changes_raw = _transform_data_preview.get("changes_made", [])
+        if isinstance(_changes_raw, list) and _changes_raw:
+            enriched_changes = _enrich_changes_made(_changes_raw, journal_style)
+            logger.info(
+                "[PIPELINE] Enriched %d changes_made entries with rule references",
+                len(enriched_changes),
+            )
+    except Exception as _ie:
+        logger.warning("[PIPELINE] Could not extract transform results (non-fatal): %s", _ie)
+
+    logger.info("[PIPELINE] Writing formatted DOCX (source_docx=%s)...",
+                "in-place" if source_docx_path else "from-text")
     t0 = time.time()
-    docx_filename = _write_docx_from_transform(transform_raw, rules)
+    docx_filename = _write_docx_from_transform(transform_raw, rules, source_docx_path, paper_content)
     logger.info("[PIPELINE] DOCX written — file=%s in %.2fs", docx_filename, time.time() - t0)
 
     total_elapsed = round(time.time() - pipeline_start, 1)
@@ -465,6 +964,8 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
         "docx_filename": docx_filename,
         "output_metadata": output_metadata,
         "pipeline_metrics": pipeline_metrics,
+        "interpretation_results": interpretation_results,
+        "changes_made": enriched_changes,  # Rule-referenced, from transform PHASE B
     }
 
     # Improvement 7: Cache for instant re-runs of identical submissions
@@ -572,13 +1073,77 @@ def _parse_compliance_report(raw: str) -> dict:
     return report
 
 
-def _write_docx_from_transform(transform_raw: str, rules: dict) -> str:
+_SECTION_TYPE_MAP: dict[str, dict] = {
+    # LLM-returned types (from transform prompt) → docx_writer internal types
+    "heading_h1":       {"type": "heading", "level": 1},
+    "heading_h2":       {"type": "heading", "level": 2},
+    "heading_h3":       {"type": "heading", "level": 3},
+    "body_paragraph":   {"type": "paragraph"},
+    "abstract":         {"type": "abstract"},
+    "figure_caption":   {"type": "figure_caption"},
+    "table_caption":    {"type": "table_caption"},
+    "reference_entry":  {"type": "reference"},
+    "title":            {"type": "title"},
+    # Already-normalised passthrough (identity mappings)
+    "heading":          {"type": "heading"},
+    "paragraph":        {"type": "paragraph"},
+    "reference":        {"type": "reference"},
+}
+
+
+def _normalize_section_types(sections: list) -> list:
     """
-    Extract docx_instructions from transform output and write the DOCX file.
+    Normalize LLM-returned section type strings to docx_writer-compatible values.
+
+    The transform prompt instructs the LLM to return types like HEADING_H1,
+    BODY_PARAGRAPH, REFERENCE_ENTRY — but write_formatted_docx() expects
+    'heading', 'paragraph', 'reference'. This function bridges that gap.
+
+    For HEADING_H1/H2/H3 it also injects the correct 'level' field if missing.
+    Unknown types fall back to 'paragraph' (logged as a warning).
+    """
+    normalized = []
+    for sec in sections:
+        if not isinstance(sec, dict):
+            continue
+        raw_type = str(sec.get("type", "paragraph")).lower()
+        mapping = _SECTION_TYPE_MAP.get(raw_type)
+        if mapping:
+            merged = {**sec, **mapping}
+            # Respect explicit 'level' from LLM if it provided one and mapping doesn't override
+            if "level" not in mapping and "level" in sec:
+                merged["level"] = sec["level"]
+            normalized.append(merged)
+        else:
+            logger.warning(
+                "[DOCX] Unknown section type '%s' — falling back to 'paragraph'", raw_type
+            )
+            normalized.append({**sec, "type": "paragraph"})
+    return normalized
+
+
+def _write_docx_from_transform(
+    transform_raw: str,
+    rules: dict,
+    source_docx_path: Optional[str] = None,
+    paper_content: Optional[str] = None,
+) -> str:
+    """
+    Extract transform output and write the formatted DOCX file.
+
+    Two paths:
+      - DOCX input (source_docx_path provided): calls transform_docx_in_place()
+        which opens the original DOCX and applies transformations in-place,
+        preserving all figures, tables, equations, and embedded objects.
+      - PDF / TXT input (no source_docx_path): calls write_formatted_docx()
+        which reconstructs the document from extracted text (binary elements lost).
+        Applies 8A verbatim content guard and 8B schema validation before write.
 
     Args:
         transform_raw: Raw string output from transform_task.
-        rules: Journal rules dict injected as source of truth for docx_writer.
+        rules: Journal rules dict — source of truth for all formatting values.
+        source_docx_path: Path to the original uploaded DOCX, or None for PDF/TXT.
+        paper_content: Original paper text — used by verbatim content guard (8A).
 
     Returns:
         Output filename (not full path) for the generated DOCX.
@@ -587,10 +1152,8 @@ def _write_docx_from_transform(transform_raw: str, rules: dict) -> str:
         TransformError: If docx_instructions or sections key is missing.
         DocumentWriteError: Propagated from docx_writer if writing fails.
     """
-    # extract_json_from_llm raises LLMResponseError on failure
     transform_data = extract_json_from_llm(transform_raw)
 
-    # HARD REQUIREMENT: docx_instructions must exist
     if "docx_instructions" not in transform_data:
         raise TransformError(
             "Transform result is missing 'docx_instructions' key. "
@@ -599,8 +1162,17 @@ def _write_docx_from_transform(transform_raw: str, rules: dict) -> str:
         )
 
     docx_instructions = transform_data["docx_instructions"]
+    output_filename = f"formatted_{uuid.uuid4().hex[:8]}.docx"
+    output_path = str(OUTPUT_DIR / output_filename)
 
-    # HARD REQUIREMENT: sections must be a non-empty list
+    # ── Path A: DOCX source — in-place transformation (figures/tables preserved) ──
+    if source_docx_path and Path(source_docx_path).exists():
+        logger.info("[DOCX] In-place transformation — source=%s → %s",
+                    Path(source_docx_path).name, output_filename)
+        transform_docx_in_place(source_docx_path, transform_data, rules, output_path)
+        return output_filename
+
+    # ── Path B: PDF / TXT — rebuild from extracted text ───────────────────────────
     sections = docx_instructions.get("sections") if docx_instructions else None
     if not isinstance(sections, list) or len(sections) == 0:
         raise TransformError(
@@ -610,14 +1182,19 @@ def _write_docx_from_transform(transform_raw: str, rules: dict) -> str:
             f"{list(docx_instructions.keys()) if isinstance(docx_instructions, dict) else '(not a dict)'}"
         )
 
-    # Inject the real journal rules so docx_writer always has the source of truth
+    # 8B: Validate schema before write — catches LLM schema drift early
+    _validate_docx_instructions(docx_instructions)
+
+    # 8A: Verbatim content guard — filter empties, restore truncated abstract
+    sections = _guard_section_contents(sections, paper_content)
+    if not sections:
+        raise TransformError(
+            "All sections were empty after content guard — transform agent produced no usable content."
+        )
+
+    docx_instructions["sections"] = _normalize_section_types(sections)
     docx_instructions["rules"] = rules
-
-    output_filename = f"formatted_{uuid.uuid4().hex[:8]}.docx"
-    output_path = str(OUTPUT_DIR / output_filename)
-
-    logger.info("[DOCX] Building document — %d sections → %s", len(sections), output_filename)
-
-    # write_formatted_docx raises DocumentWriteError on failure — let it propagate
+    logger.info("[DOCX] Rebuilding from text — %d sections → %s",
+                len(docx_instructions["sections"]), output_filename)
     write_formatted_docx(docx_instructions, output_path)
     return output_filename

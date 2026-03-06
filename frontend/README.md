@@ -2,7 +2,7 @@
 
 > React 18 + Vite + TailwindCSS — dark-theme SPA for the autonomous manuscript formatting pipeline.
 
-The frontend is a single-page application that guides the user through uploading a research paper, monitoring the 5-agent AI pipeline, and reviewing the compliance report with download access to the formatted DOCX output.
+The frontend is a single-page application that guides the user through uploading a research paper, monitoring the 4-agent AI pipeline, and reviewing the compliance report with download access to the formatted DOCX output. Large papers (>500KB) are handled via async polling — the UI remains in loading state while the backend processes the job.
 
 ---
 
@@ -93,6 +93,10 @@ stateDiagram-v2
     state loading {
         [*] --> stepTimer : setInterval per pipeline step durations
         stepTimer --> updateStep : every 10s (approx pipeline timing)
+        [*] --> polling : if response has job_id (large file >500KB)
+        polling --> polling : GET /status/{job_id} every 4s
+        polling --> success : status === "done"
+        polling --> error : status === "error" or 10min timeout
     }
 
     state success {
@@ -131,6 +135,7 @@ App.jsx
     ├── SuccessView              # Inline component — wraps all success content
     │   ├── <download banner>    # Green banner with Download .docx + Format Another
     │   ├── ComplianceScore.jsx  # Overall score + 7-section breakdown bars
+    │   ├── ViolationsDetected.jsx # Phase A violations from transform agent
     │   ├── IMRADCheck.jsx       # Introduction/Methods/Results/Discussion pills
     │   ├── ChangesList.jsx      # Applied changes with expand/collapse
     │   └── RecommendationsCard # Inline component: recommendation list
@@ -151,6 +156,7 @@ frontend/
 │   │   ├── ProcessingLoader.jsx  # Pipeline progress visualization
 │   │   ├── ComplianceScore.jsx   # Compliance score dashboard
 │   │   ├── ChangesList.jsx       # Applied changes list with pagination
+│   │   ├── ViolationsDetected.jsx # Phase A violations surfaced from transform agent
 │   │   └── IMRADCheck.jsx        # IMRAD structure status display
 │   │
 │   ├── App.jsx                   # Root component: state machine + layout
@@ -203,6 +209,7 @@ Root component. Manages the 4-state machine and all HTTP communication.
 - Fetches `/health` on mount (5s timeout) to populate journal dropdown; falls back to `FALLBACK_JOURNALS` on failure — no error shown to user.
 - `FORMAT_TIMEOUT_MS = 0` — pipeline runs indefinitely, no client-side timeout.
 - Step timer advances `loadingStep` on approximate pipeline timings (10s/10s/2s/15s/10s) to animate the loader.
+- If `/format` returns `{job_id, poll_url}`, `pollJobStatus()` polls every 4s (max 150 polls / 10 min).
 - `document.documentElement.classList.add("dark")` — enforces permanently dark theme.
 
 **Error parsing logic:**
@@ -327,6 +334,24 @@ Collapsible list of formatting corrections applied by the pipeline.
 
 ---
 
+### ViolationsDetected.jsx
+
+Displays the Phase A violation scan results from the Transform agent — one card per detected rule violation.
+
+**Props:**
+
+| Prop | Type | Description |
+|------|------|-------------|
+| `data` | `object` | `{violations: [...], total_violations, journal}` from `interpretation_results` |
+
+**Key behaviors:**
+
+- Rendered only when `interpretationResults?.violations?.length > 0`
+- Each violation shows: `rule_category`, `rule_description`, `rule_reference`, `violation_found`, `fix_applied`
+- Color-coded by severity — violations use red/amber badges
+
+---
+
 ### IMRADCheck.jsx
 
 Displays IMRAD (Introduction / Methods / Results / Discussion) section presence as colored pills.
@@ -357,11 +382,12 @@ proxy: {
   "/format":   { target: "http://localhost:8000", timeout: 0 },
   "/download": { target: "http://localhost:8000", timeout: 0 },
   "/health":   { target: "http://localhost:8000", timeout: 0 },
+  "/status":   { target: "http://localhost:8000", timeout: 5000 },
 }
 ```
 
-- `timeout: 0` — no proxy timeout, pipeline runs as long as needed
-- All API calls use relative URLs (`/format`, `/health`, `/download/*`) — no hardcoded ports in React code
+- `timeout: 0` — no proxy timeout for `/format` and `/download`; `/status` uses 5s (polling calls are short)
+- All API calls use relative URLs (`/format`, `/health`, `/download/*`, `/status/*`) — no hardcoded ports in React code
 - In production, replace the proxy with a reverse proxy (nginx, Caddy) or update `VITE_BACKEND_URL`
 
 **Note**: If the backend is not running, Vite returns HTTP 502. The frontend maps 502 to a "Cannot connect to backend" message. The `/health` call on mount will silently fall back to `FALLBACK_JOURNALS` — no error is shown.
@@ -562,6 +588,8 @@ Handled silently — falls back to `FALLBACK_JOURNALS` list. No error state is e
 | Click Download | Browser opens new tab and downloads `.docx` |
 | Click Format Another | Returns to idle state, all fields reset |
 | Long paper (>60s) | Footer message changes to "Taking longer than usual..." |
+| Large file (>500KB) | HTTP 202 received; UI stays in loading state while polling `/status/{job_id}` |
+| Async job completes | Polling detects `status === "done"`, transitions to success state |
 | Backend returns error during pipeline | Error state with specific message + "Try Again" |
 | Kill backend mid-request | Error state: "Cannot connect to backend..." |
 

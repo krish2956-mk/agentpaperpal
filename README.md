@@ -2,7 +2,7 @@
 
 > Autonomous manuscript formatting system built for HackaMined 2026 — Cactus Communications (Paperpal by Editage) track.
 
-Agent Paperpal is a full-stack AI application that accepts a research paper (PDF or DOCX) and a target journal style, then autonomously detects every formatting violation, applies corrections, generates a formatted DOCX output, and produces a scored compliance report — all powered by a 5-agent CrewAI pipeline backed by Google Gemini.
+Agent Paperpal is a full-stack AI application that accepts a research paper (PDF or DOCX) and a target journal style, then autonomously detects every formatting violation, applies corrections, generates a formatted DOCX output, and produces a scored compliance report — all powered by a 4-agent CrewAI pipeline backed by Google Gemini 2.5 Flash.
 
 ---
 
@@ -49,12 +49,15 @@ Agent Paperpal eliminates manual formatting effort through a multi-agent AI pipe
 |---------|-------------|
 | Multi-format input | Upload PDF or DOCX (up to 10 MB) |
 | 5 journal styles | APA 7th Edition, IEEE, Vancouver, Springer, Chicago 17th |
-| 5-agent AI pipeline | Sequential CrewAI agents, each with a single responsibility |
+| 4-agent AI pipeline | Sequential CrewAI agents; Transform agent runs inline violation scan (Phase A) + formatting (Phase B) |
 | Compliance scoring | 7-section breakdown (Document Format, Abstract, Headings, Citations, References, Figures, Tables) |
 | IMRAD detection | Checks for Introduction, Methods, Results, Discussion presence |
-| DOCX output | Formatted manuscript ready for download |
+| DOCX output | Formatted manuscript ready for download; in-place transformation for DOCX inputs |
 | Pipeline caching | SHA-256 keyed in-memory cache — identical submissions return instantly |
-| No timeout | Pipeline runs until complete, regardless of paper size |
+| Async processing | Files >500KB processed as background jobs; poll `/status/{job_id}` for results |
+| Verbatim content guard | 8A — filters empty sections, restores truncated abstract from original text |
+| Schema validation | 8B — jsonschema validates `docx_instructions` before DOCX write |
+| Rule references | Every applied change annotated with authoritative journal rule section |
 
 ### Target Users
 
@@ -82,12 +85,11 @@ graph TB
         Pipeline["run_pipeline()"]
     end
 
-    subgraph CrewAI["CrewAI 5-Agent Pipeline (Sequential)"]
+    subgraph CrewAI["CrewAI 4-Agent Pipeline (Sequential)"]
         A1["Agent 1: INGEST\nLabel content blocks"]
         A2["Agent 2: PARSE\nExtract paper_structure JSON"]
-        A3["Agent 3: INTERPRET\nLoad journal rules"]
-        A4["Agent 4: TRANSFORM\nApply formatting fixes"]
-        A5["Agent 5: VALIDATE\n7 compliance checks + score"]
+        A4["Agent 3: TRANSFORM\nPhase A: scan violations\nPhase B: apply fixes + docx_instructions"]
+        A5["Agent 4: VALIDATE\n7 compliance checks + score"]
     end
 
     subgraph Storage["Storage"]
@@ -112,10 +114,9 @@ graph TB
     A4 --> A5
     A1 <-->|"LLM calls"| Gemini
     A2 <-->|"LLM calls"| Gemini
-    A3 <-->|"LLM calls"| Gemini
     A4 <-->|"LLM calls"| Gemini
     A5 <-->|"LLM calls"| Gemini
-    A3 -->|"load rules"| Rules
+    A4 -->|"load rules"| Rules
     A5 -->|"write DOCX"| Outputs
     API -->|"temp file"| Uploads
     API -->|"GET /download/:file"| Outputs
@@ -146,17 +147,19 @@ Agent Paperpal uses a **layered architecture** with a clear separation between:
 
 | Component | Responsibility |
 |-----------|---------------|
-| `main.py` | HTTP routing, input validation (5 guards), error mapping, file cleanup |
-| `crew.py` | Pipeline orchestration, caching, truncation, task output validation |
+| `main.py` | HTTP routing, input validation (5 guards), async job routing, file cleanup |
+| `crew.py` | Pipeline orchestration, caching, section-aware context building, 8A/8B guards |
 | `agents/ingest_agent.py` | Label raw text blocks with structural type markers |
 | `agents/parse_agent.py` | Extract structured `paper_structure` JSON from labelled content |
-| `agents/interpret_agent.py` | Load and return journal rules JSON |
-| `agents/transform_agent.py` | Compare paper vs rules, produce `docx_instructions` |
+| `agents/transform_agent.py` | Phase A: inline violation scan; Phase B: apply fixes + `docx_instructions` |
 | `agents/validate_agent.py` | Run 7 compliance checks, score 0-100, return `compliance_report` |
-| `tools/docx_writer.py` | Write formatted DOCX from `docx_instructions` |
+| `tools/docx_writer.py` | Write formatted DOCX — in-place (DOCX) or text-rebuild (PDF/TXT) |
 | `tools/rule_loader.py` | Load and cache `rules/*.json` files |
 | `tools/pdf_reader.py` | Extract text from PDF via PyMuPDF |
 | `tools/docx_reader.py` | Extract text from DOCX via python-docx |
+| `tools/text_chunker.py` | Split paper into IMRAD sections, compute word counts |
+| `tools/compliance_checker.py` | Deterministic compliance checks (Python-exact, overrides LLM scores) |
+| `tools/rule_extractor.py` | Web-based journal rule extraction via BeautifulSoup |
 
 ---
 
@@ -173,7 +176,7 @@ Agent Paperpal uses a **layered architecture** with a clear separation between:
 | Backend | FastAPI | 0.111.0 | Async HTTP API framework |
 | Backend | Uvicorn | 0.29.0 | ASGI server |
 | AI Orchestration | CrewAI | >=0.36.0 | Multi-agent pipeline framework |
-| AI Model | Google Gemini | 2.5-flash | LLM for all 5 agents |
+| AI Model | Google Gemini | 2.5-flash | LLM for all 4 agents |
 | Document Processing | PyMuPDF (fitz) | 1.24.0 | PDF text extraction |
 | Document Processing | python-docx | 1.1.0 | DOCX read and write |
 | Validation | jsonschema | >=4.0.0 | JSON schema validation |
@@ -191,9 +194,8 @@ HACKa-MINed/
 │   │   ├── __init__.py             # Exports all 5 create_*_agent() factories
 │   │   ├── ingest_agent.py         # Agent 1: Content labelling
 │   │   ├── parse_agent.py          # Agent 2: Structure extraction
-│   │   ├── interpret_agent.py      # Agent 3: Rule loading
-│   │   ├── transform_agent.py      # Agent 4: Formatting application
-│   │   └── validate_agent.py       # Agent 5: Compliance scoring
+│   │   ├── transform_agent.py      # Agent 3: Phase A scan + Phase B transform
+│   │   └── validate_agent.py       # Agent 4: Compliance scoring
 │   │
 │   ├── engine/                     # Formatting engine utilities
 │   │   └── format_engine.py        # Document formatting helpers
@@ -201,8 +203,11 @@ HACKa-MINed/
 │   ├── tools/                      # Shared utility tools
 │   │   ├── pdf_reader.py           # PDF text extraction (PyMuPDF)
 │   │   ├── docx_reader.py          # DOCX text extraction (python-docx)
-│   │   ├── docx_writer.py          # Formatted DOCX generation
+│   │   ├── docx_writer.py          # Formatted DOCX generation (in-place + rebuild)
 │   │   ├── rule_loader.py          # Journal rules JSON loader + JOURNAL_MAP
+│   │   ├── text_chunker.py         # IMRAD section splitter + word count stats
+│   │   ├── compliance_checker.py   # Deterministic compliance checks (Python-exact)
+│   │   ├── rule_extractor.py       # Web-based journal rule extraction (BeautifulSoup)
 │   │   ├── logger.py               # Structured logger factory (get_logger)
 │   │   └── tool_errors.py          # Custom exception hierarchy
 │   │
@@ -228,6 +233,7 @@ HACKa-MINed/
 │   │   │   ├── ProcessingLoader.jsx # 5-step pipeline progress UI
 │   │   │   ├── ComplianceScore.jsx  # Score dashboard with animated bars
 │   │   │   ├── ChangesList.jsx      # Applied changes with expand/collapse
+│   │   │   ├── ViolationsDetected.jsx # Phase A violations from transform agent
 │   │   │   └── IMRADCheck.jsx       # IMRAD structure status pills
 │   │   ├── App.jsx                  # Root: 4-state machine + layout
 │   │   ├── index.css               # Tailwind base + keyframes + utilities
@@ -271,7 +277,6 @@ sequenceDiagram
     participant Crew as crew.run_pipeline()
     participant A1 as Ingest Agent
     participant A2 as Parse Agent
-    participant A3 as Interpret Agent
     participant A4 as Transform Agent
     participant A5 as Validate Agent
     participant Gemini as Google Gemini
@@ -299,17 +304,12 @@ sequenceDiagram
     Gemini-->>A2: paper_structure
     A2-->>Crew: Task output
 
-    Crew->>A3: INTERPRET task
-    A3->>Gemini: Return journal rules
-    Gemini-->>A3: rules JSON
-    A3-->>Crew: Task output
-
-    Crew->>A4: TRANSFORM task (context: parse + interpret)
-    A4->>Gemini: Compare + produce docx_instructions
-    Gemini-->>A4: docx_instructions JSON
+    Crew->>A4: TRANSFORM task (context: parse)\nPhase A: scan violations\nPhase B: apply fixes
+    A4->>Gemini: Produce violations + docx_instructions JSON
+    Gemini-->>A4: transform JSON
     A4-->>Crew: Task output
 
-    Crew->>A5: VALIDATE task (context: transform + interpret)
+    Crew->>A5: VALIDATE task (context: transform)
     A5->>Gemini: 7 compliance checks + score
     Gemini-->>A5: compliance_report JSON
     A5-->>Crew: Task output
@@ -562,6 +562,17 @@ graph TB
 
 ## API Documentation
 
+### Endpoints Summary
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | System status + supported journals |
+| `POST` | `/format` | Upload paper → run pipeline → return report + download URL |
+| `GET` | `/download/{filename}` | Download generated DOCX |
+| `GET` | `/status/{job_id}` | Poll status of async background job (large files >500KB) |
+
+---
+
 ### GET /health
 
 Health check — returns system status and supported journals.
@@ -644,13 +655,34 @@ Upload a research paper and format it.
     "warnings": ["3 references older than 10 years"],
     "recommendations": ["Add a Discussion section to complete IMRAD structure"]
   },
-  "changes_made": ["Reformatted 14 in-text citations to APA style"],
+  "changes_made": [
+    { "what": "Reformatted 14 in-text citations to APA style", "rule_reference": "APA 7th §8.11", "why": "Required by APA 7th §8.11" }
+  ],
   "processing_time_seconds": 47.3,
   "output_metadata": { "filename": "formatted_3193503d.docx", "size_bytes": 24576, "size_kb": 24.0 },
   "pipeline_metrics": {
-    "stage_times": { "ingest": 9.2, "parse": 11.4, "interpret": 1.8, "transform": 14.6, "validate": 10.1 },
+    "stage_times": { "ingest": 9.2, "parse": 11.4, "transform": 14.6, "validate": 10.1 },
     "total_runtime": 47.3
+  },
+  "interpretation_results": {
+    "violations": [
+      { "rule_category": "citations", "rule_description": "...", "rule_reference": "APA 7th §8.11", "violation_found": "...", "fix_applied": "..." }
+    ],
+    "total_violations": 3,
+    "journal": "APA 7th Edition"
   }
+}
+```
+
+**Large file (>500KB) — async response (HTTP 202):**
+```json
+{
+  "success": true,
+  "async": true,
+  "job_id": "3193503d",
+  "status": "processing",
+  "poll_url": "/status/3193503d",
+  "message": "Large file (620KB) queued for background processing. Poll /status/3193503d for results."
 }
 ```
 
@@ -686,6 +718,37 @@ Download a formatted DOCX file.
 **Response 200:** Binary DOCX file stream
 
 **Security:** Regex validates filename (`^[a-zA-Z0-9_\-\.]+$`), only `.docx` served, path confined to `outputs/` directory.
+
+---
+
+### GET /status/{job_id}
+
+Poll status of a background pipeline job (created for files >500KB).
+
+| Field | Value |
+|-------|-------|
+| Method | `GET` |
+| URL | `/status/{job_id}` |
+| Auth | None |
+
+**Path Parameters:** `job_id` — 8-character hex string returned by `/format` async response.
+
+**Response — processing:**
+```json
+{ "status": "processing" }
+```
+
+**Response — done:**
+```json
+{ "status": "done", "result": { ...same shape as /format 200 response... } }
+```
+
+**Response — error:**
+```json
+{ "status": "error", "error": "Pipeline error message" }
+```
+
+**Security:** `job_id` validated as `^[a-f0-9]{8}$` — rejects injection attempts.
 
 ---
 
@@ -807,11 +870,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 | Optimization | Implementation |
 |-------------|---------------|
 | Pipeline caching | SHA-256 keyed in-memory dict — identical (paper + journal) submissions return instantly |
-| Context truncation | Papers >32K chars are trimmed to first 24K + last 8K chars (preserves references) |
+| Section-aware context | `text_chunker.split_into_sections()` pre-labels IMRAD structure before agents run |
+| Async large files | Files >500KB routed to `BackgroundTasks` — HTTP 202 + poll `/status/{job_id}` |
 | Step timing | `_StepTimer` logs wall-clock per stage for performance analysis |
 | No request timeout | `FORMAT_TIMEOUT_MS = 0` and Vite proxy `timeout: 0` — never kills in-flight requests |
 | Stale file cleanup | Auto-cleanup on startup, not per-request |
-| Rule caching | `InterpretAgent._RULE_ENGINE_CACHE` caches loaded rule files in memory |
+| Verbatim content guard | 8A filters empty sections and restores truncated abstract from original text |
+| Schema validation | 8B validates `docx_instructions` with jsonschema before DOCX write |
 | Animated skeleton UI | Compliance score shows skeleton rows during loading, not empty state |
 
 ---
@@ -819,8 +884,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 ## Future Roadmap
 
 - [ ] Support additional journal styles (Nature, Elsevier, ACS, PLOS)
-- [ ] Asynchronous processing with job queue (Celery + Redis) for concurrent users
-- [ ] WebSocket progress updates from backend pipeline to frontend
+- [x] Asynchronous processing with background jobs for large files (>500KB)
+- [ ] WebSocket real-time progress updates from backend pipeline to frontend
 - [ ] PDF output generation (in addition to DOCX)
 - [ ] Persistent results storage (PostgreSQL) with 7-day retention
 - [ ] User accounts and submission history

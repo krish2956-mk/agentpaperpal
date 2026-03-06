@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -66,7 +66,64 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 MIN_TEXT_LENGTH = 100
 MIN_ALPHA_RATIO = 0.3  # Minimum ratio of alphabetic chars — rejects garbled/scanned text
-ALLOWED_EXTENSIONS = {"pdf", "docx"}
+ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
+ASYNC_THRESHOLD = 500_000  # 500KB — files above this are processed as background jobs
+
+# ── 8C: Async job store — in-memory, keyed by job_id ──────────────────────────
+# Stores job status/result for background pipeline jobs (large files >500KB).
+JOB_STORE: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# 8C — Background pipeline worker for async jobs
+# ---------------------------------------------------------------------------
+def _run_pipeline_job(
+    paper_text: str,
+    journal: str,
+    job_id: str,
+    fidelity_warnings: list,
+) -> None:
+    """
+    Background worker for large-file async processing (>500KB).
+
+    Receives pre-extracted text (not a file path — the upload is deleted before
+    this runs). Writes result into JOB_STORE[job_id] when complete.
+
+    Note: source_docx_path is intentionally NOT passed — the upload temp file
+    is deleted by the /format handler's finally block before this runs.
+    Large DOCX files processed async use text-rebuild path (figures not preserved).
+    """
+    start = time.time()
+    logger.info("[JOB:%s] Background pipeline started — journal=%s chars=%d",
+                job_id, journal, len(paper_text))
+    try:
+        result = run_pipeline(paper_text, journal, source_docx_path=None)
+        compliance_report = result["compliance_report"]
+        enriched_changes = result.get("changes_made", []) or compliance_report.get("changes_made", [])
+        elapsed = round(time.time() - start, 1)
+        logger.info("[JOB:%s] Pipeline complete — score=%s elapsed=%.1fs",
+                    job_id, compliance_report.get("overall_score", "?"), elapsed)
+        JOB_STORE[job_id] = {
+            "status": "done",
+            "result": {
+                "success": True,
+                "request_id": job_id,
+                "download_url": f"/download/{result['docx_filename']}",
+                "compliance_report": compliance_report,
+                "changes_made": enriched_changes,
+                "processing_time_seconds": elapsed,
+                "output_metadata": result.get("output_metadata", {}),
+                "pipeline_metrics": result.get("pipeline_metrics", {}),
+                "interpretation_results": result.get("interpretation_results", {}),
+                "fidelity_warnings": fidelity_warnings,
+            },
+        }
+    except Exception as e:
+        logger.exception("[JOB:%s] Background pipeline failed: %s", job_id, e)
+        JOB_STORE[job_id] = {
+            "status": "error",
+            "error": str(e),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +228,34 @@ async def health() -> dict:
     }
 
 
+def _read_text_with_fallback(path: str) -> str:
+    """
+    Read a plain text file, trying encodings in order: UTF-8 → Latin-1 → CP-1252.
+    Returns the decoded string on the first successful encoding.
+    Raises HTTPException if all encodings fail (file is not decodable text).
+    """
+    for encoding in ("utf-8", "latin-1", "cp1252"):
+        try:
+            with open(path, "r", encoding=encoding) as fh:
+                return fh.read()
+        except UnicodeDecodeError:
+            continue
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "success": False,
+            "error": "Could not decode the .txt file. Supported encodings: UTF-8, Latin-1, CP-1252.",
+            "step": "extraction",
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /format — main endpoint
 # ---------------------------------------------------------------------------
 @app.post("/format")
 async def format_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     journal: str = Form(...),
 ) -> JSONResponse:
@@ -251,6 +331,8 @@ async def format_document(
         t0 = time.time()
         if ext == "pdf":
             paper_text = extract_pdf_text(str(upload_path))
+        elif ext == "txt":
+            paper_text = _read_text_with_fallback(str(upload_path))
         else:
             paper_text = extract_docx_text(str(upload_path))
         logger.info(
@@ -298,14 +380,61 @@ async def format_document(
                     },
                 )
 
-        # ── Pipeline execution ───────────────────────────────────────────────
+        # ── Fidelity warnings — determined by file type, not pipeline result ──
+        fidelity_warnings = []
+        if ext == "pdf":
+            fidelity_warnings.append(
+                "PDF input: figures, tables, and equations cannot be preserved in the output DOCX "
+                "because PDF text extraction loses binary elements. "
+                "Upload the original .docx file for full-fidelity transformation."
+            )
+        elif ext == "txt":
+            fidelity_warnings.append(
+                "Plain text input: document formatting and embedded objects cannot be recovered. "
+                "Upload the original .docx file for full-fidelity transformation."
+            )
+
+        # ── 8C: Route large files to async background processing ──────────────
+        # Large files (>500KB) are processed as background jobs to avoid HTTP timeout.
+        # Small files (demo papers) take the sync path — identical to pre-8C behaviour.
+        if len(content) > ASYNC_THRESHOLD:
+            job_id = request_id  # Reuse request_id as job_id — already unique
+            JOB_STORE[job_id] = {"status": "processing"}
+            # Note: source_docx NOT passed — upload is deleted in finally before task runs.
+            # Large DOCX files processed async use text-rebuild path (figures not preserved).
+            background_tasks.add_task(
+                _run_pipeline_job, paper_text, journal, job_id, fidelity_warnings
+            )
+            logger.info(
+                "[REQUEST:%s] Large file (%sKB > %dKB threshold) → async job",
+                request_id, size_kb, ASYNC_THRESHOLD // 1000,
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "success": True,
+                    "async": True,
+                    "job_id": job_id,
+                    "status": "processing",
+                    "poll_url": f"/status/{job_id}",
+                    "message": (
+                        f"Large file ({size_kb}KB) queued for background processing. "
+                        f"Poll /status/{job_id} for results."
+                    ),
+                },
+            )
+
+        # ── Sync path: small files processed immediately (unchanged) ──────────
         logger.info(
-            "[REQUEST:%s] Starting CrewAI pipeline — journal=%s chars=%d",
-            request_id, journal, len(paper_text),
+            "[REQUEST:%s] Starting CrewAI pipeline — journal=%s chars=%d input=%s",
+            request_id, journal, len(paper_text), ext.upper(),
         )
         start = time.time()
 
-        result = run_pipeline(paper_text, journal)
+        # Pass the original DOCX path for in-place transformation (preserves figures/tables).
+        # PDF and TXT inputs fall back to text-reconstruction mode.
+        source_docx = str(upload_path) if ext == "docx" else None
+        result = run_pipeline(paper_text, journal, source_docx_path=source_docx)
 
         elapsed = round(time.time() - start, 1)
         docx_filename = result["docx_filename"]
@@ -313,6 +442,10 @@ async def format_document(
         overall_score = compliance_report.get("overall_score", "N/A")
         output_metadata = result.get("output_metadata", {})
         pipeline_metrics = result.get("pipeline_metrics", {})
+        interpretation_results = result.get("interpretation_results", {})
+        # Prefer enriched changes from transform PHASE B (rule-referenced);
+        # fall back to validate agent's changes_made if transform produced nothing.
+        enriched_changes = result.get("changes_made", []) or compliance_report.get("changes_made", [])
 
         # Improvement 8: warn if pipeline exceeded expected runtime
         if elapsed > MAX_PIPELINE_RUNTIME:
@@ -334,10 +467,12 @@ async def format_document(
                 "request_id": request_id,
                 "download_url": f"/download/{docx_filename}",
                 "compliance_report": compliance_report,
-                "changes_made": compliance_report.get("changes_made", []),
+                "changes_made": enriched_changes,
                 "processing_time_seconds": elapsed,
                 "output_metadata": output_metadata,
                 "pipeline_metrics": pipeline_metrics,
+                "fidelity_warnings": fidelity_warnings,
+                "interpretation_results": interpretation_results,
             },
         )
 
@@ -470,3 +605,39 @@ async def download_file(filename: str) -> FileResponse:
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /status/{job_id} — 8C async job polling
+# ---------------------------------------------------------------------------
+@app.get("/status/{job_id}")
+async def get_job_status(job_id: str) -> JSONResponse:
+    """
+    Poll endpoint for async background jobs (large files >500KB).
+
+    Returns:
+      - {"status": "processing"} while running
+      - {"status": "done", "result": {...}} when complete — result shape is
+        identical to the synchronous /format response
+      - {"status": "error", "error": "..."} on failure
+
+    Security: job_id is validated as alphanumeric hex to prevent injection.
+    """
+    if not re.match(r"^[a-f0-9]{8}$", job_id):
+        raise HTTPException(
+            status_code=400,
+            detail={"success": False, "error": "Invalid job_id format."},
+        )
+
+    job = JOB_STORE.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "error": f"Job '{job_id}' not found. It may have expired or never existed.",
+            },
+        )
+
+    logger.debug("[STATUS] job_id=%s status=%s", job_id, job.get("status"))
+    return JSONResponse(status_code=200, content=job)

@@ -1,17 +1,30 @@
 import { useState } from "react";
-import { CheckCheck, ChevronDown, ChevronUp } from "lucide-react";
+import { CheckCheck, ChevronDown, ChevronUp, BookOpen } from "lucide-react";
 
 const INITIAL_VISIBLE = 6;
+
+// Normalise each entry — handle both plain strings and structured {what, rule_reference, why}
+function normalise(change) {
+  if (typeof change === "string") return { what: change, rule_reference: null, why: null };
+  if (change && typeof change === "object") {
+    return {
+      what: change.what || change.description || String(change),
+      rule_reference: change.rule_reference || null,
+      why: change.why || null,
+    };
+  }
+  return { what: String(change), rule_reference: null, why: null };
+}
 
 export default function ChangesList({ changes }) {
   const [showAll, setShowAll] = useState(false);
 
-  // Edge cases: null, undefined, or empty
   if (!changes || changes.length === 0) return null;
 
-  const visibleChanges = showAll ? changes : changes.slice(0, INITIAL_VISIBLE);
-  const hiddenCount = changes.length - INITIAL_VISIBLE;
-  const hasMore = changes.length > INITIAL_VISIBLE;
+  const items = changes.map(normalise);
+  const visibleItems = showAll ? items : items.slice(0, INITIAL_VISIBLE);
+  const hiddenCount = items.length - INITIAL_VISIBLE;
+  const hasMore = items.length > INITIAL_VISIBLE;
 
   return (
     <div className="bg-gray-900 rounded-2xl border border-gray-800 p-5">
@@ -20,19 +33,30 @@ export default function ChangesList({ changes }) {
         <CheckCheck className="w-4 h-4 text-green-400" />
         Changes Applied
         <span className="text-xs font-normal text-gray-500 ml-1">
-          ({changes.length} correction{changes.length !== 1 ? "s" : ""})
+          ({items.length} correction{items.length !== 1 ? "s" : ""})
         </span>
       </h3>
 
-      <ol className="space-y-2">
-        {visibleChanges.map((change, i) => (
+      <ol className="space-y-3">
+        {visibleItems.map((item, i) => (
           <li key={i} className="flex items-start gap-3 group">
             <span className="shrink-0 flex items-center justify-center w-5 h-5 rounded-full bg-blue-950 border border-blue-900/60 text-blue-400 text-xs font-bold mt-0.5">
               {i + 1}
             </span>
-            <span className="text-sm text-gray-400 leading-relaxed group-hover:text-gray-300 transition-colors font-mono">
-              {change}
-            </span>
+            <div className="flex-1 min-w-0">
+              <span className="text-sm text-gray-300 leading-relaxed group-hover:text-white transition-colors">
+                {item.what}
+              </span>
+              {item.rule_reference && (
+                <span className="inline-flex items-center gap-1 ml-2 px-1.5 py-0.5 rounded text-xs font-mono text-blue-400 bg-blue-950/40 border border-blue-900/40 shrink-0 whitespace-nowrap">
+                  <BookOpen className="w-2.5 h-2.5" />
+                  {item.rule_reference}
+                </span>
+              )}
+              {item.why && item.rule_reference && (
+                <p className="text-xs text-gray-600 mt-0.5">{item.why}</p>
+              )}
+            </div>
           </li>
         ))}
       </ol>
