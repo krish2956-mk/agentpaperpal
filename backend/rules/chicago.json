@@ -1,0 +1,124 @@
+{
+  "style_name": "Chicago 17th Edition (Author-Date)",
+  "document": {
+    "font": "Times New Roman",
+    "font_size": 12,
+    "line_spacing": 2.0,
+    "margins": {
+      "top": "1in",
+      "bottom": "1in",
+      "left": "1in",
+      "right": "1in"
+    },
+    "alignment": "left",
+    "columns": 1
+  },
+  "title_page": {
+    "title_case": "Title Case",
+    "title_bold": false,
+    "title_centered": true,
+    "title_font_size": 12
+  },
+  "abstract": {
+    "label": "Abstract",
+    "label_bold": false,
+    "label_centered": true,
+    "label_italic": false,
+    "max_words": null,
+    "indent_first_line": true,
+    "keywords_present": false
+  },
+  "headings": {
+    "H1": {
+      "bold": true,
+      "italic": false,
+      "centered": true,
+      "underline": false,
+      "case": "Title Case",
+      "numbering": "none",
+      "font_size": 12
+    },
+    "H2": {
+      "bold": false,
+      "italic": false,
+      "centered": false,
+      "underline": false,
+      "case": "Title Case",
+      "numbering": "none",
+      "font_size": 12
+    },
+    "H3": {
+      "bold": false,
+      "italic": true,
+      "centered": false,
+      "underline": false,
+      "indent": false,
+      "case": "Title Case",
+      "numbering": "none",
+      "inline_with_text": false,
+      "font_size": 12
+    }
+  },
+  "citations": {
+    "style": "author-date",
+    "brackets": "parentheses",
+    "format_one_author": "(Smith 2020)",
+    "format_two_authors": "(Smith and Jones 2020)",
+    "format_three_plus": "(Smith et al. 2020)",
+    "format_numbered": null,
+    "include_page_for_quotes": true,
+    "page_format": "45"
+  },
+  "references": {
+    "section_label": "References",
+    "label_bold": false,
+    "label_centered": true,
+    "label_italic": false,
+    "ordering": "alphabetical",
+    "hanging_indent": true,
+    "indent_size": "0.5in",
+    "line_spacing": 1.0,
+    "space_between_entries": true,
+    "formats": {
+      "journal_article": "Author, First. Year. \"Title of Article.\" Journal Name Volume (Issue): Page–Page. https://doi.org/xxxxx.",
+      "book": "Author, First. Year. Title of Book. City: Publisher.",
+      "book_chapter": "Author, First. Year. \"Title of Chapter.\" In Title of Book, edited by First Editor, Page–Page. City: Publisher.",
+      "website": "Author, First. Year. \"Title of Page.\" Name of Site. Month Day, Year. URL.",
+      "conference_paper": "Author, First. Year. \"Title of Paper.\" Paper presented at Conference Name, City, Month Day–Day."
+    }
+  },
+  "figures": {
+    "label_prefix": "Figure",
+    "label_bold": false,
+    "label_italic": false,
+    "caption_position": "below",
+    "caption_italic": false,
+    "caption_alignment": "left",
+    "numbering": "arabic",
+    "note_label": "Note:"
+  },
+  "tables": {
+    "label_prefix": "Table",
+    "label_bold": false,
+    "label_italic": false,
+    "caption_position": "above",
+    "caption_italic": false,
+    "caption_alignment": "left",
+    "numbering": "arabic",
+    "border_style": "top_bottom_only",
+    "note_label": "Note:"
+  },
+  "equations": {
+    "numbering": "right_aligned",
+    "numbering_format": "(1)"
+  },
+  "general_rules": {
+    "doi_format": "https://doi.org/xxxxx",
+    "url_format": "direct url",
+    "date_format": "YYYY",
+    "et_al_threshold": 4,
+    "use_ampersand_in_citations": false,
+    "use_ampersand_in_references": false,
+    "oxford_comma": true
+  }
+}

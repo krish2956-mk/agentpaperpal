@@ -67,34 +67,43 @@ All colors MUST come from this dark theme palette — no ad-hoc values.
 
 ```
 frontend/src/
-├── App.jsx                    ← Root + 4-state machine (idle/loading/success/error)
+├── App.jsx                        ← Root + 4-state machine + async polling loop
 ├── components/
-│   ├── Upload.jsx             ← File drag-drop + journal selector + submit
-│   ├── ComplianceScore.jsx    ← Overall score + per-section progress bars
-│   ├── ChangesList.jsx        ← Explainable list of all changes made
-│   └── BeforeAfter.jsx        ← Side-by-side document comparison (optional)
-└── index.css                  ← Tailwind directives + custom keyframes
+│   ├── Upload.jsx                 ← File drag-drop + journal selector + submit
+│   ├── ProcessingLoader.jsx       ← Animated pipeline step progress (spinner + dots)
+│   ├── ComplianceScore.jsx        ← Overall score + per-section progress bars
+│   ├── ChangesList.jsx            ← Explainable list of changes with §rule refs
+│   ├── ViolationsDetected.jsx     ← Phase A violations from transform agent
+│   └── IMRADCheck.jsx             ← IMRAD structure completeness cards
+└── index.css                      ← Tailwind directives + custom keyframes
 ```
 
 ---
 
-## 4. App.jsx — 4-State Machine
+## 4. App.jsx — 4-State Machine + Async Polling
+
+The app uses Vite proxy (`/format`, `/status`, `/download`, `/health` → `localhost:8000`).
+No hardcoded `API_BASE` — all paths are relative via proxy.
 
 ```jsx
 import { useState } from "react"
 import Upload from "./components/Upload"
+import ProcessingLoader from "./components/ProcessingLoader"
 import ComplianceScore from "./components/ComplianceScore"
 import ChangesList from "./components/ChangesList"
+import ViolationsDetected from "./components/ViolationsDetected"
+import IMRADCheck from "./components/IMRADCheck"
 import axios from "axios"
 
-const API_BASE = "http://localhost:8000"
+// 4-agent pipeline steps with approximate timings (ms) for step indicator
+// Ingest=10s, Parse=10s, Transform=15s, Validate=10s
+const STEP_TIMINGS = [10000, 10000, 15000, 10000]
 
 const PIPELINE_STEPS = [
   "Reading document...",
   "Detecting structure...",
-  "Loading journal rules...",
   "Formatting document...",
-  "Validating output...",
+  "Validating compliance...",
 ]
 
 const JOURNALS = [
@@ -113,40 +122,62 @@ export default function App() {
   const [result, setResult] = useState(null)
   const [error, setError] = useState("")
 
+  // Async job polling — used when backend returns HTTP 202 (large files, 8C)
+  const pollJobStatus = async (pollUrl) => {
+    const POLL_INTERVAL_MS = 4000
+    const MAX_POLLS = 150  // 10 minutes max
+    for (let i = 0; i < MAX_POLLS; i++) {
+      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
+      const res = await axios.get(pollUrl)
+      if (res.data.status === "done") return res.data.result
+      if (res.data.status === "error") {
+        throw new Error(res.data.error || "Background processing failed.")
+      }
+      // status === "processing" → keep polling
+    }
+    throw new Error("Job timed out after 10 minutes. Please try again.")
+  }
+
   const handleFormat = async () => {
     if (!file || !journal) return
 
     setStatus("loading")
     setCurrentStep(0)
 
-    // Simulate pipeline step progression (~9s per step = 45s total)
+    // Advance step indicator per approximate pipeline timings
+    let stepIndex = 0
     const stepInterval = setInterval(() => {
-      setCurrentStep(prev =>
-        prev < PIPELINE_STEPS.length - 1 ? prev + 1 : prev
-      )
-    }, 9000)
+      stepIndex++
+      if (stepIndex < PIPELINE_STEPS.length) setCurrentStep(stepIndex)
+      else clearInterval(stepInterval)
+    }, STEP_TIMINGS[stepIndex] || 10000)
 
     try {
       const formData = new FormData()
       formData.append("file", file)
       formData.append("journal", journal)
 
-      const response = await axios.post(
-        `${API_BASE}/format`,
-        formData,
-        {
-          headers: { "Content-Type": "multipart/form-data" },
-          timeout: 120000,  // 120s — pipeline can take up to 60s
-        }
-      )
+      // POST to /format via Vite proxy (no hardcoded API_BASE)
+      const response = await axios.post("/format", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 0,  // no timeout — pipeline can take as long as needed
+      })
 
       clearInterval(stepInterval)
-      setResult(response.data)
+
+      // 8C: Large file — response has job_id, poll until complete
+      let resultData = response.data
+      if (resultData.job_id && resultData.poll_url) {
+        resultData = await pollJobStatus(resultData.poll_url)
+      }
+
+      setResult(resultData)
       setStatus("success")
 
     } catch (err) {
       clearInterval(stepInterval)
-      const msg = err.response?.data?.error
+      const msg = err.response?.data?.detail?.error
+        || err.response?.data?.error
         || err.message
         || "Pipeline failed. Please try again."
       setError(msg)
@@ -564,8 +595,55 @@ export default function ChangesList({ changes }) {
 
 ## 9. ResultsView — Success State
 
+The success view renders multiple components from the pipeline result:
+
 ```jsx
-// Inline in App.jsx or extract to components/ResultsView.jsx
+// Inline in App.jsx — SuccessView function
+function SuccessView({ result, complianceReport, changesMade, interpretationResults, onDownload, onReset }) {
+  return (
+    <>
+      {/* Download Banner */}
+      <div className="bg-green-950/50 border border-green-800/60 rounded-2xl p-5 ...">
+        <button onClick={onDownload}>Download .docx</button>
+        <button onClick={onReset}>Format Another</button>
+      </div>
+
+      {/* Compliance Score Dashboard */}
+      <ComplianceScore report={complianceReport} />
+
+      {/* Violations Detected — from transform agent Phase A */}
+      {interpretationResults?.violations?.length > 0 && (
+        <ViolationsDetected data={interpretationResults} />
+      )}
+
+      {/* IMRAD Structure Check */}
+      {complianceReport?.imrad_check && (
+        <IMRADCheck imrad={complianceReport.imrad_check} />
+      )}
+
+      {/* Changes Applied — with §rule references */}
+      {changesMade?.length > 0 && (
+        <ChangesList changes={changesMade} />
+      )}
+
+      {/* Recommendations */}
+      {complianceReport?.recommendations?.length > 0 && (
+        <RecommendationsCard recs={complianceReport.recommendations} />
+      )}
+    </>
+  )
+}
+```
+
+**Data mapping from API response**:
+```js
+const compliance_report = result?.compliance_report
+const changes_made = result?.changes_made || compliance_report?.changes_made || []
+const interpretation_results = result?.interpretation_results
+```
+
+**Legacy pattern** (for reference — old single-component ResultsView):
+```jsx
 function ResultsView({ result, onReset }) {
   return (
     <div className="space-y-6">
@@ -575,7 +653,7 @@ function ResultsView({ result, onReset }) {
 
       {/* Changes List */}
       <ChangesList
-        changes={result.compliance_report?.changes_made || []}
+        changes={result.compliance_report?.changes_made || result?.changes_made || []}
       />
 
       {/* Processing time */}
@@ -615,6 +693,37 @@ function ResultsView({ result, onReset }) {
   )
 }
 ```
+
+---
+
+## 9b. ViolationsDetected.jsx — Phase A Violations
+
+Surfaces raw violations from the transform agent (Phase A) before DOCX corrections are applied.
+
+```jsx
+export default function ViolationsDetected({ data }) {
+  const violations = data?.violations || []
+  if (!violations.length) return null
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
+      <h3 className="text-sm font-semibold text-red-400 mb-3">
+        Violations Detected ({violations.length})
+      </h3>
+      <ul className="space-y-2">
+        {violations.map((v, i) => (
+          <li key={i} className="text-xs text-gray-400 bg-gray-800 rounded-lg p-3">
+            <span className="text-red-300 font-medium">{v.element}</span>
+            {" — "}{v.current_state} → {v.required_state}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+```
+
+**Data source**: `result.interpretation_results` from API response.
 
 ---
 
@@ -693,9 +802,9 @@ html {
 | State | What User Sees | Action Available |
 |-------|---------------|-----------------|
 | `idle` | Upload zone + journal picker + submit | Upload file, select journal, submit |
-| `loading` | Spinner + step name + progress dots | None (wait) |
-| `success` | Score dashboard + changes + download | Download DOCX, Format Another |
-| `error` | Error message | Try Again |
+| `loading` | ProcessingLoader — spinner + step name + progress dots. For async jobs (large files): stays in loading state while polling `/status/{job_id}` every 4s | None (wait) |
+| `success` | ComplianceScore + ViolationsDetected + IMRADCheck + ChangesList + RecommendationsCard + Download button | Download DOCX, Format Another |
+| `error` | Error message with optional step info + "Try Again" | Try Again (resets to idle) |
 
 **Never** show upload form while processing. **Never** show results without download button.
 
@@ -720,7 +829,8 @@ score < 70  → bg-red-500   (Poor — significant violations)
 - Step dots: inactive=gray-600, current=blue-400 with ring, completed=blue-500
 - Step text: shows current step name at all times
 - Never show "Step X of Y" numbers — show descriptive text only
-- Total ~45s — advance every 9s
+- 4 pipeline steps with variable timings: Ingest 10s, Parse 10s, Transform 15s, Validate 10s
+- For async jobs: step progress continues while polling; UI stays in loading state until `status === "done"`
 
 ### 12.5 File Drop Zone Behavior
 

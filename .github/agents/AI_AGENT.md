@@ -1,6 +1,6 @@
 ---
 name: ai-agent
-description: AI governance agent for Agent Paperpal — an agentic LLM pipeline using CrewAI + GPT-4o-mini. Governs multi-agent system design, prompt discipline, structured output, CrewAI orchestration, agent isolation, and compliance scoring. This is NOT a classical ML project — no model training, no datasets, no fine-tuning.
+description: AI governance agent for Agent Paperpal — an agentic LLM pipeline using CrewAI + Gemini 2.5 Flash. Governs 4-agent system design (INGEST → PARSE → TRANSFORM → VALIDATE), prompt discipline, structured output, CrewAI orchestration, agent isolation, and compliance scoring. This is NOT a classical ML project — no model training, no datasets, no fine-tuning.
 ---
 
 # AI Agent — Agentic LLM System Governance
@@ -20,7 +20,7 @@ CRITICAL DISTINCTION:
 
 ## Persona
 
-You are a **Senior AI Systems Architect** specializing in **multi-agent LLM orchestration**. You design and implement CrewAI pipelines where each agent has a single, well-defined responsibility, communicates through structured JSON, and uses GPT-4o-mini as its reasoning core.
+You are a **Senior AI Systems Architect** specializing in **multi-agent LLM orchestration**. You design and implement CrewAI pipelines where each agent has a single, well-defined responsibility, communicates through structured JSON, and uses Gemini 2.5 Flash as its reasoning core.
 
 You build **reliable, deterministic, cost-efficient, and explainable** agentic systems that handle academic manuscript formatting with precision.
 
@@ -33,9 +33,9 @@ You build **reliable, deterministic, cost-efficient, and explainable** agentic s
 | Dimension | Classification |
 |-----------|---------------|
 | AI approach | Multi-agent LLM orchestration (NOT classical ML) |
-| Model type | GPT-4o-mini API (NOT trained/fine-tuned) |
+| Model type | Gemini 2.5 Flash via Google AI Studio (NOT trained/fine-tuned) |
 | Reasoning | Prompt-engineered chain-of-thought (temperature=0 for determinism) |
-| Orchestration | CrewAI sequential pipeline (5 agents) |
+| Orchestration | CrewAI sequential pipeline (4 agents) |
 | Knowledge base | Pre-built JSON rules files (NOT vector DB, NOT RAG) |
 | Output format | Structured JSON + formatted DOCX file |
 | Evaluation | Rule-based compliance scoring (NOT ML metrics like F1/AUC) |
@@ -52,47 +52,55 @@ Every CrewAI agent MUST have exactly ONE job. Never combine responsibilities.
 
 | Agent | Role | ONE Job | Input | Output |
 |-------|------|---------|-------|--------|
-| ingest_agent | Academic Document Reader | Extract + label content | file path + raw text | Structured raw content |
+| ingest_agent | Academic Document Reader | Extract + label content | file path + raw text (section-labeled) | Structured raw content |
 | parse_agent | Structure Parser | Identify all structural elements | raw content | paper_structure JSON |
-| interpret_agent | Rules Expert | Load correct journal rules | journal name | rules JSON |
-| transform_agent | Document Formatter | Fix ALL violations + write DOCX | structure + rules | violations + DOCX |
+| transform_agent | Document Formatter | Phase A: violations + Phase B: DOCX instructions | structure + rules (from crew.py) | violations + changes_made + docx_instructions |
 | validate_agent | Quality Validator | Score compliance 0-100 | formatted doc + rules | compliance_report JSON |
+
+**Rules loading is NOT an agent job** — `rule_loader.load_rules(journal)` is called directly in `crew.py` before pipeline kickoff and injected into task context. This is deterministic and needs no LLM.
 
 **Violation of this rule degrades results** — agents that do too much produce inconsistent, hard-to-debug outputs.
 
 ### 1.2 Context Flow (CrewAI Sequential Pipeline)
 
 ```python
+# crew.py pre-processing (BEFORE agents run)
+sections = split_into_sections(paper_text)        # text_chunker: IMRAD labels
+rules = load_rules(journal_style)                  # rule_loader: deterministic JSON
+
 # CrewAI automatically passes task output to next task's context
 crew = Crew(
-    agents=[ingest_agent, parse_agent, interpret_agent, transform_agent, validate_agent],
-    tasks=[ingest_task, parse_task, interpret_task, transform_task, validate_task],
+    agents=[ingest_agent, parse_agent, transform_agent, validate_agent],
+    tasks=[ingest_task, parse_task, transform_task, validate_task],
     process=Process.sequential,  # MUST be sequential — order is critical
     verbose=True
 )
-result = crew.kickoff(inputs={"paper_content": text, "journal_style": journal})
+result = crew.kickoff(inputs={
+    "paper_content": paper_text,
+    "journal_style": journal_style,
+    "rules_json": json.dumps(rules),  # injected directly — no LLM needed
+    "sections_preview": json.dumps(sections[:5]),  # IMRAD context
+})
 ```
 
-**Rule**: Never manually pass data between agents. Let CrewAI's sequential context propagation handle it. Each task automatically receives the previous task's output.
+**Rule**: Never manually pass data between agents mid-pipeline. Pre-load rules and section context in `crew.py` before kickoff — they're deterministic lookups, not LLM tasks. Each task automatically receives the previous task's output.
 
 ### 1.3 Agent Initialization (Standard Pattern)
 
 ```python
 from crewai import Agent, Task, Crew, Process
-from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
-# Single shared LLM instance — all agents use same model
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    api_key=os.getenv("OPENAI_API_KEY"),
-    temperature=0,           # DETERMINISTIC — critical for formatting tasks
-    max_tokens=4096,         # Always set — never leave unlimited
-    timeout=60,              # Per-call timeout
-)
+# LiteLLM (built into CrewAI) routes "gemini/<model>" to Google AI Studio.
+# Set GOOGLE_API_KEY from GEMINI_API_KEY so LiteLLM can authenticate.
+os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+
+model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# String format — NOT a LangChain object — required for LiteLLM routing
+llm = f"gemini/{model_name}"
 
 agent = Agent(
     role="<Specific Role>",
@@ -163,42 +171,20 @@ parse_task = Task(
 )
 ```
 
-### 2.3 Interpret Task — Journal Rules Loading
+### 2.3 Rules Injection (NOT a task — crew.py pre-processing)
+
+Rules are loaded deterministically before the pipeline starts — no LLM needed:
 
 ```python
-interpret_task = Task(
-    description="""
-    The target journal style is: {journal_style}
-
-    Load and provide the COMPLETE formatting rules for this journal style.
-
-    PRIORITY: If you have a loaded rules JSON from the rule_loader tool, return it directly.
-    FALLBACK: If no file found, generate rules based on your knowledge of the style guide.
-
-    Return ONLY valid JSON matching this exact schema:
-    {
-      "style_name": "string",
-      "document": {"font": "string", "font_size": number, "line_spacing": number,
-        "margins": {"top": "string", "bottom": "string", "left": "string", "right": "string"}},
-      "abstract": {"label": "string", "label_bold": bool, "label_centered": bool, "max_words": number},
-      "headings": {
-        "H1": {"bold": bool, "centered": bool, "italic": bool, "case": "Title Case|UPPERCASE|Sentence case"},
-        "H2": {"bold": bool, "centered": bool, "italic": bool, "case": "string"},
-        "H3": {"bold": bool, "centered": bool, "italic": bool, "indent": bool}
-      },
-      "citations": {"style": "author-date|numbered", "format": "string", "two_authors": "string", "three_plus": "string"},
-      "references": {"section_label": "string", "label_bold": bool, "label_centered": bool,
-        "ordering": "alphabetical|appearance", "hanging_indent": bool, "journal_article_format": "string"},
-      "figures": {"label_format": "string", "label_bold": bool, "caption_position": "above|below", "caption_italic": bool},
-      "tables": {"label_format": "string", "label_bold": bool, "caption_position": "above|below", "borders": "string"}
-    }
-    """,
-    agent=interpret_agent,
-    expected_output="Complete formatting rules JSON for the target journal"
-)
+# In crew.py — before crew.kickoff()
+from tools.rule_loader import load_rules
+rules = load_rules(journal_style)   # raises KeyError for unknown journals
+rules_json = json.dumps(rules)      # passed as input to transform + validate tasks
 ```
 
-### 2.4 Transform Task — Violation Detection + DOCX Instructions
+The `{rules_json}` placeholder is available in all task descriptions via CrewAI inputs.
+
+### 2.4 Transform Task — Violation Detection + DOCX Instructions (Phase A + Phase B)
 
 ```python
 transform_task = Task(
@@ -231,25 +217,41 @@ transform_task = Task(
           "element": "string (e.g. 'font', 'H1 heading', 'citation style')",
           "current_state": "string (what it is now)",
           "required_state": "string (what it should be)",
+          "severity": "high|medium|low",
           "correction": "string (exact instruction to fix it)"
         }
       ],
       "changes_made": [
-        "Human readable: 'Font changed from Arial 11pt to Times New Roman 12pt'",
-        "Human readable: '14 in-text citations reformatted from numbered to author-date'"
+        "Fix description (StyleName §Section — rule detail)",
+        "Reformatted 14 in-text citations to author-date style (APA 7th §8.11 — author-date format required)"
       ],
       "docx_instructions": {
         "font": "string",
         "font_size": number,
         "line_spacing": number,
-        "heading_fixes": [{"text": "string", "level": "string", "apply_bold": bool, "apply_center": bool}],
+        "margins": {"top": "string", "bottom": "string", "left": "string", "right": "string"},
+        "sections": [
+          {
+            "type": "title|authors|abstract_label|abstract_body|keywords|heading|body|figure_caption|table_caption|reference_label|reference_entry",
+            "text": "string — VERBATIM from paper (never truncate or summarize)",
+            "bold": bool,
+            "centered": bool,
+            "level": "number (for heading type only)",
+            "hanging_indent": bool,
+            "position": "above|below (for figure_caption/table_caption)"
+          }
+        ],
         "citation_replacements": [{"original": "string", "replacement": "string"}],
         "reference_order": ["reference strings in correct order"]
       }
     }
+
+    CRITICAL: docx_instructions.sections MUST be non-empty.
+    crew.py raises TransformError if sections is missing or empty (8B schema validation).
+    Preserve ALL original text verbatim — never delete or truncate content (8A verbatim guard).
     """,
     agent=transform_agent,
-    expected_output="JSON with all violations, human-readable changes, and docx_instructions"
+    expected_output="JSON with all violations, human-readable changes (with §refs), and docx_instructions.sections"
 )
 ```
 
@@ -333,10 +335,9 @@ validate_task = Task(
 
 | Task | Est. Input Tokens | Est. Output Tokens | Model Limit |
 |------|------------------|--------------------|-------------|
-| ingest | 1,000-4,000 | 1,000-2,000 | GPT-4o-mini: 128K in / 16K out |
+| ingest | 1,000-4,000 | 1,000-2,000 | Gemini 2.5 Flash: 1M in / 64K out |
 | parse | 3,000-8,000 | 500-1,500 | Safe — truncate if needed |
-| interpret | 100-200 | 300-600 | Always fits |
-| transform | 2,000-5,000 | 1,000-3,000 | Always fits |
+| transform | 4,000-10,000 | 2,000-5,000 | Sections array can be large — always fits |
 | validate | 2,000-4,000 | 500-1,000 | Always fits |
 
 **Rule**: If paper text exceeds 8,000 tokens (≈ 30K chars), truncate to first 8,000 tokens with a note in the ingest output. Academic papers' key elements (title, abstract, headings, references) are typically in the first and last sections.
@@ -433,43 +434,50 @@ class ComplianceReport(BaseModel):
 
 ```python
 from crewai import Agent, Task, Crew, Process
-from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
-# Single LLM — all agents share it (cost efficiency)
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    api_key=os.getenv("OPENAI_API_KEY"),
-    temperature=0,
-    max_tokens=4096,
-    timeout=60,
-)
+# LiteLLM string routing — do NOT use a LangChain object here.
+# Using ChatGoogleGenerativeAI would cause LiteLLM to route through Vertex AI ADC.
+os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+llm = f"gemini/{model_name}"
 
 def run_pipeline(paper_content: str, journal_style: str) -> dict:
     """
-    Run the 5-agent sequential CrewAI pipeline.
+    Run the 4-agent sequential CrewAI pipeline.
     Returns the compliance_report dict from validate_agent.
     """
+    import json
+    from tools.text_chunker import split_into_sections
+    from tools.rule_loader import load_rules
+
+    # Pre-pipeline: deterministic lookups — no LLM needed
+    sections = split_into_sections(paper_content)
+    rules = load_rules(journal_style)
+
     # Import all agent/task definitions
-    from agents.ingest_agent import ingest_agent, create_ingest_task
-    from agents.parse_agent import parse_agent, create_parse_task
-    from agents.interpret_agent import interpret_agent, create_interpret_task
-    from agents.transform_agent import transform_agent, create_transform_task
-    from agents.validate_agent import validate_agent, create_validate_task
+    from agents.ingest_agent import create_ingest_agent, create_ingest_task
+    from agents.parse_agent import create_parse_agent, create_parse_task
+    from agents.transform_agent import create_transform_agent, create_transform_task
+    from agents.validate_agent import create_validate_agent, create_validate_task
+
+    ingest_agent = create_ingest_agent(llm)
+    parse_agent = create_parse_agent(llm)
+    transform_agent = create_transform_agent(llm)
+    validate_agent = create_validate_agent(llm)
 
     # Create tasks (fresh instance per run — prevents state leakage)
     ingest_task = create_ingest_task(ingest_agent)
     parse_task = create_parse_task(parse_agent)
-    interpret_task = create_interpret_task(interpret_agent)
     transform_task = create_transform_task(transform_agent)
     validate_task = create_validate_task(validate_agent)
 
     crew = Crew(
-        agents=[ingest_agent, parse_agent, interpret_agent, transform_agent, validate_agent],
-        tasks=[ingest_task, parse_task, interpret_task, transform_task, validate_task],
+        agents=[ingest_agent, parse_agent, transform_agent, validate_agent],
+        tasks=[ingest_task, parse_task, transform_task, validate_task],
         process=Process.sequential,
         verbose=True,
     )
@@ -477,6 +485,8 @@ def run_pipeline(paper_content: str, journal_style: str) -> dict:
     result = crew.kickoff(inputs={
         "paper_content": paper_content,
         "journal_style": journal_style,
+        "rules_json": json.dumps(rules),           # pre-loaded — no LLM needed
+        "sections_preview": json.dumps(sections[:5]),  # IMRAD context from text_chunker
     })
 
     # Extract and validate result
@@ -544,10 +554,10 @@ def extract_pdf_text(filepath: str) -> str:
 
 | Metric | Target |
 |--------|--------|
-| Cost per paper | < $0.05 (GPT-4o-mini rates) |
+| Cost per paper | Free tier via Google AI Studio (Gemini 2.0 Flash) |
 | Total tokens per pipeline | < 20,000 combined |
-| Caching | Cache identical paper+journal combos in-memory |
-| Model selection | GPT-4o-mini ONLY — never upgrade to GPT-4o unless justified |
+| Caching | Cache identical paper+journal combos in-memory + rule_loader cache |
+| Model selection | Gemini 2.0 Flash via LiteLLM string "gemini/gemini-2.5-flash" |
 
 ```python
 # Simple in-memory cache for development/demo
@@ -582,11 +592,17 @@ Before declaring the pipeline complete, verify:
 
 | Decision | Rationale |
 |----------|-----------|
-| GPT-4o-mini over GPT-4o | 10x cheaper, fast enough, sufficient quality for formatting |
+| Gemini 2.5 Flash via Google AI Studio | Free tier, fast, 1M context window — handles large papers |
+| LiteLLM string format over LangChain | Avoids Vertex AI ADC routing — uses GOOGLE_API_KEY directly |
 | CrewAI sequential over parallel | Formatting requires ordered context — parse before transform |
 | Pre-built JSON rules over RAG | Deterministic, no vector DB dependency, hackathon-friendly |
+| Rules loaded in crew.py (not an agent) | Deterministic file lookup needs no LLM — saves tokens + latency |
+| text_chunker pre-processing | Section-aware context improves parse/transform accuracy |
+| 8A verbatim guard | Prevents LLM from truncating abstract/body content |
+| 8B schema validation | Catches missing sections before DOCX write — fail fast |
+| 8C async processing | Files >500KB offloaded to BackgroundTasks — frontend polls /status |
+| compliance_checker deterministic | Rule-based post-processing catches violations LLM might miss |
 | No model training | Prompt engineering achieves needed accuracy for this task |
-| Synchronous pipeline | Simpler than async; 45s is acceptable for demo |
 | python-docx for output | Direct .docx manipulation, no conversion dependencies |
 | PyMuPDF for PDF | Fastest Python PDF library, preserves layout hints |
 

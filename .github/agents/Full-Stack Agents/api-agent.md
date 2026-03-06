@@ -45,13 +45,16 @@ You produce **secure, correct, and maintainable** Python backends that follow Fa
 
 ### Files You READ / WRITE
 
-- `backend/main.py` — FastAPI app + all routes
-- `backend/crew.py` — `run_pipeline()` function
+- `backend/main.py` — FastAPI app + all routes + BackgroundTasks (8C)
+- `backend/crew.py` — `run_pipeline()` + `JOB_STORE` + reliability features
 - `backend/tools/pdf_reader.py` — `extract_pdf_text()`
 - `backend/tools/docx_reader.py` — `extract_docx_text()`
-- `backend/tools/docx_writer.py` — `write_formatted_docx()`
+- `backend/tools/docx_writer.py` — `write_formatted_docx()`, `transform_docx_in_place()`
 - `backend/tools/rule_loader.py` — `load_rules()`, `JOURNAL_MAP`
-- `backend/.env` — `OPENAI_API_KEY`
+- `backend/tools/text_chunker.py` — `split_into_sections()`
+- `backend/tools/compliance_checker.py` — `run_deterministic_checks()`, `apply_deterministic_checks()`
+- `backend/tools/rule_extractor.py` — `extract_journal_rules_from_url()` (BeautifulSoup)
+- `backend/.env` — `GEMINI_API_KEY` + `GOOGLE_API_KEY`
 - `backend/requirements.txt`
 
 ### Files You NEVER MODIFY
@@ -72,7 +75,7 @@ You produce **secure, correct, and maintainable** Python backends that follow Fa
 | Validation | Pydantic v2 | 2.7.0 |
 | Config | python-dotenv | 1.0.1 |
 | HTTP client | requests | 2.31.0 |
-| AI pipeline | crewai | 0.28.0 |
+| AI pipeline | crewai | 0.36.0+ |
 | PDF parsing | pymupdf | 1.24.0 |
 | DOCX | python-docx | 1.1.0 |
 
@@ -147,11 +150,11 @@ async def format_document(
 ):
     """
     Main pipeline endpoint:
-    1. Validate file type + size
+    1. Validate file type + size + journal
     2. Extract text from PDF/DOCX
-    3. Run CrewAI 5-agent pipeline
-    4. Write formatted DOCX
-    5. Return compliance report + download URL
+    3. For files >500KB: run async via BackgroundTasks, return HTTP 202 + poll_url (8C)
+    4. For small files: run CrewAI 4-agent pipeline synchronously
+    5. Return compliance report + download URL + changes_made + interpretation_results
     """
     start_time = time.time()
 
@@ -336,7 +339,7 @@ safe_filename = f"{unique_id}_{sanitize_filename(file.filename)}"
 
 ## 3. Response Format Standards
 
-### 3.1 Success Response
+### 3.1 Success Response (Sync — small files ≤500KB)
 
 ```json
 {
@@ -350,8 +353,35 @@ safe_filename = f"{unique_id}_{sanitize_filename(file.filename)}"
     "citation_consistency": { ... },
     "warnings": [ ... ]
   },
+  "changes_made": [
+    "Reformatted 14 citations to author-date style (APA 7th §8.11 — author-date format required)"
+  ],
+  "interpretation_results": {
+    "violations": [ ... ],
+    "changes_made": [ ... ]
+  },
   "processing_time_seconds": 43.2
 }
+```
+
+### 3.1b Async Response (Large files >500KB) — HTTP 202
+
+```json
+{
+  "job_id": "abc12345",
+  "poll_url": "/status/abc12345",
+  "status": "processing"
+}
+```
+
+Frontend polls `GET /status/{job_id}` every 4 seconds until `status === "done"`.
+
+### 3.1c Status Endpoint Response
+
+```json
+{ "status": "processing" }
+{ "status": "done", "result": { ... same as 3.1 success response ... } }
+{ "status": "error", "error": "Pipeline execution failed." }
 ```
 
 ### 3.2 Validation Error Response
@@ -631,9 +661,9 @@ cd backend && mypy main.py --ignore-missing-imports
 ## 8. requirements.txt
 
 ```
-crewai==0.28.0
-langchain-openai==0.1.6
-openai==1.25.0
+crewai>=0.36.0
+google-generativeai>=0.8.0
+litellm>=1.0.0
 pymupdf==1.24.0
 python-docx==1.1.0
 fastapi==0.111.0
@@ -642,6 +672,8 @@ python-multipart==0.0.9
 pydantic==2.7.0
 python-dotenv==1.0.1
 requests==2.31.0
+beautifulsoup4>=4.12.0
+jsonschema>=4.0.0
 pytest==7.4.0
 httpx==0.27.0
 ```
@@ -683,7 +715,7 @@ httpx==0.27.0
 ### Never Do
 - Put business logic in main.py (route logic only)
 - Expose stack traces in error responses
-- Hardcode `OPENAI_API_KEY` (always `.env`)
+- Hardcode `GEMINI_API_KEY` or `GOOGLE_API_KEY` (always `.env`)
 - Return raw exceptions from pipeline
 - Skip file type validation
 - Allow arbitrary file paths in download endpoint
