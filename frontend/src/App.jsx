@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import Upload from './components/Upload'
-import ComplianceScore from './components/ComplianceScore'
-import ChangesList from './components/ChangesList'
-import TransformationReport from './components/TransformationReport'
+import ProgressScreen from './components/ProgressScreen'
+import ResultsScreen from './components/ResultsScreen'
+import SemiCustomPanel from './components/SemiCustomPanel'
 
 // Prevent browser from restoring scroll position on refresh
 if (typeof window !== 'undefined') {
@@ -11,6 +11,7 @@ if (typeof window !== 'undefined') {
   window.scrollTo(0, 0)
 }
 
+const API = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
 // ─── SVG Icon Set ────────────────────────────────────────────
 const Icons = {
@@ -92,21 +93,11 @@ const Icons = {
   )
 }
 
-const JOURNALS = ['APA 7th Edition', 'IEEE', 'Vancouver', 'Springer', 'Chicago']
-
-const PIPELINE_STEPS = [
-  'Reading your document...',
-  'Detecting paper structure...',
-  'Loading journal rules...',
-  'Applying formatting rules...',
-  'Validating compliance...'
-]
-
 const FEATURES = [
   { icon: Icons.file,     iconClass: 'fi-blue',   title: 'PDF & DOCX Input',     desc: 'Upload any research paper up to 10MB. We preserve every word.' },
   { icon: Icons.journals, iconClass: 'fi-orange',  title: '5 Journal Styles',     desc: 'APA 7th, IEEE, Vancouver, Springer & Chicago — built in.' },
   { icon: Icons.chart,    iconClass: 'fi-blue',   title: 'Compliance Score',     desc: 'Section-by-section accuracy score from 0–100.' },
-  { icon: Icons.bolt,     iconClass: 'fi-orange',  title: 'Sub-60 Second Speed', desc: 'Gemini 2.5 Flash runs 5 AI agents in parallel for fast results.' }
+  { icon: Icons.bolt,     iconClass: 'fi-orange',  title: 'Sub-60 Second Speed', desc: 'Gemini 3 Flash runs 5 AI agents in parallel for fast results.' }
 ]
 
 const STEPS = [
@@ -125,6 +116,163 @@ function useVisible(threshold = 0.15) {
     return () => obs.disconnect()
   }, [])
   return [ref, vis]
+}
+
+// ─── Category icon map for breakdown cards ───────────────────
+const CATEGORY_ICONS = {
+  abstract: (
+    <svg width="20" height="20" fill="none" viewBox="0 0 24 24">
+      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round"/>
+      <path d="M14 2v6h6M8 13h8M8 17h5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+    </svg>
+  ),
+  citations: (
+    <svg width="20" height="20" fill="none" viewBox="0 0 24 24">
+      <path d="M10 11h-4a1 1 0 01-1-1V6a1 1 0 011-1h3a1 1 0 011 1v5zm0 0a4 4 0 01-4 4M20 11h-4a1 1 0 01-1-1V6a1 1 0 011-1h3a1 1 0 011 1v5zm0 0a4 4 0 01-4 4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  ),
+  references: (
+    <svg width="20" height="20" fill="none" viewBox="0 0 24 24">
+      <path d="M4 19.5A2.5 2.5 0 016.5 17H20" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z" stroke="currentColor" strokeWidth="1.8"/>
+    </svg>
+  ),
+  headings: (
+    <svg width="20" height="20" fill="none" viewBox="0 0 24 24">
+      <path d="M4 12h8M4 6v12M12 6v12M20 8v8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    </svg>
+  ),
+  document_format: (
+    <svg width="20" height="20" fill="none" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="18" height="18" rx="2" stroke="currentColor" strokeWidth="1.8"/>
+      <path d="M3 9h18M9 21V9" stroke="currentColor" strokeWidth="1.8"/>
+    </svg>
+  ),
+}
+
+const CATEGORY_LABELS = {
+  abstract: 'Abstract',
+  citations: 'Citations',
+  references: 'References',
+  headings: 'Headings',
+  document_format: 'Document Format',
+}
+
+// ─── Pre-Check Gauge Component ────────────────────────────────
+function PreCheckGauge({ trustScore, onFormat, onBack }) {
+  const [animatedScore, setAnimatedScore] = useState(0)
+  const score = trustScore.total_score || 0
+
+  // Count-up animation
+  useEffect(() => {
+    setAnimatedScore(0)
+    const duration = 1200
+    const start = performance.now()
+    const animate = (now) => {
+      const elapsed = now - start
+      const progress = Math.min(elapsed / duration, 1)
+      // Ease-out cubic
+      const eased = 1 - Math.pow(1 - progress, 3)
+      setAnimatedScore(Math.round(eased * score))
+      if (progress < 1) requestAnimationFrame(animate)
+    }
+    requestAnimationFrame(animate)
+  }, [score])
+
+  // SVG circle math
+  const radius = 90
+  const circumference = 2 * Math.PI * radius
+  const strokeOffset = circumference - (animatedScore / 100) * circumference
+
+  // Color thresholds
+  const gaugeColor = score < 40 ? 'var(--error)' : score <= 70 ? 'var(--orange)' : 'var(--success)'
+  const gaugeBg = score < 40 ? 'var(--error-bg)' : score <= 70 ? 'var(--orange-light)' : 'var(--success-bg)'
+  const message = score < 40
+    ? 'Significant changes needed'
+    : score <= 70
+    ? 'Moderate compliance'
+    : 'Well structured paper'
+
+  const breakdown = trustScore.breakdown || {}
+  const categories = ['abstract', 'citations', 'references', 'headings', 'document_format']
+
+  return (
+    <>
+      {/* Circular Gauge */}
+      <div className="gauge-container">
+        <svg className="gauge-svg" viewBox="0 0 200 200">
+          {/* Background circle */}
+          <circle
+            cx="100" cy="100" r={radius}
+            fill="none"
+            stroke="var(--border)"
+            strokeWidth="12"
+          />
+          {/* Score arc */}
+          <circle
+            cx="100" cy="100" r={radius}
+            fill="none"
+            stroke={gaugeColor}
+            strokeWidth="12"
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={strokeOffset}
+            transform="rotate(-90 100 100)"
+            style={{ transition: 'stroke-dashoffset 0.05s linear' }}
+          />
+        </svg>
+        <div className="gauge-center">
+          <span className="gauge-number" style={{ color: gaugeColor }}>{animatedScore}</span>
+          <span className="gauge-label">/ 100</span>
+        </div>
+      </div>
+
+      {/* Status message */}
+      <div className="gauge-message" style={{ background: gaugeBg, color: gaugeColor }}>
+        {message}
+      </div>
+
+      {/* Category Breakdown Cards */}
+      <div className="category-breakdown">
+        <h3 className="category-breakdown-title">Category Breakdown</h3>
+        <div className="category-cards">
+          {categories.map(key => {
+            const val = breakdown[key]
+            if (!val) return null
+            const catScore = val.score ?? 0
+            const barColor = catScore >= 80 ? 'var(--success)' : catScore >= 60 ? 'var(--orange)' : 'var(--error)'
+            const icon = CATEGORY_ICONS[key] || CATEGORY_ICONS.document_format
+            const label = CATEGORY_LABELS[key] || key.replace(/_/g, ' ')
+            return (
+              <div key={key} className="category-card">
+                <div className="category-card-header">
+                  <span className="category-card-icon" style={{ color: barColor }}>{icon}</span>
+                  <span className="category-card-label">{label}</span>
+                  <span className="category-card-score" style={{ color: barColor }}>{catScore}</span>
+                </div>
+                <div className="category-bar-track">
+                  <div className="category-bar-fill" style={{ width: `${catScore}%`, background: barColor }} />
+                </div>
+                {val.issue && (
+                  <p className="category-card-issue">{val.issue}</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* CTA Buttons */}
+      <div className="pre-check-actions">
+        <button className="btn-primary" style={{ width: 'auto', padding: '14px 32px', margin: 0 }} onClick={onFormat}>
+          Format My Paper {Icons.arrow}
+        </button>
+        <button className="btn-secondary" onClick={onBack}>
+          ← Edit Overrides
+        </button>
+      </div>
+    </>
+  )
 }
 
 // ─── Shutter Transition ───────────────────────────────────────
@@ -199,9 +347,6 @@ function ScrollProgress() {
     <div className="scroll-progress">
       {SECTIONS.map((s, i) => {
         const isActive = active === s.id
-        const prevActive = i > 0 && SECTIONS.slice(0, i).some(
-          (prev, pi) => SECTIONS.indexOf(SECTIONS.find(x => x.id === active)) >= i
-        )
         return (
           <div key={s.id} className="sp-item">
             {i > 0 && (
@@ -352,8 +497,6 @@ function Landing({ onGetStarted }) {
           </div>
         </div>
       </section>
-
-
     </>
   )
 }
@@ -364,77 +507,202 @@ function Landing({ onGetStarted }) {
 const JOURNAL_META = [
   { id:'APA 7th Edition', label:'APA 7th Edition', updated:'Jan 2024' },
   { id:'IEEE',            label:'IEEE',             updated:'Mar 2024' },
+  { id:'Vancouver',       label:'Vancouver',        updated:'Feb 2024' },
   { id:'Springer',        label:'Springer',         updated:'Feb 2024' },
-  { id:'Other',           label:'Other (Custom)',   updated:null       },
+  { id:'Chicago',         label:'Chicago',           updated:'Feb 2024' },
+]
+
+const MODES = [
+  { id: 'standard',    label: 'Standard',    desc: 'Apply predefined journal rules as-is' },
+  { id: 'semi_custom', label: 'Semi Custom', desc: 'Journal rules + your custom tweaks' },
+  { id: 'full_custom', label: 'Full Custom', desc: 'Upload your own guidelines document' },
 ]
 
 // ─── Main App ──────────────────────────────────────────
 export default function App() {
+  // View state
   const [view,         setView]         = useState('landing')
+
+  // Upload state
   const [file,         setFile]         = useState(null)
+  const [docId,        setDocId]        = useState(null)
+  const [uploadInfo,   setUploadInfo]   = useState(null) // { filename, word_count, char_count, file_type }
+  const [uploading,    setUploading]    = useState(false)
+
+  // Mode & config state
+  const [selectedMode, setSelectedMode] = useState('standard')
   const [journal,      setJournal]      = useState('')
-  const [templateFile, setTemplateFile] = useState(null)    // for 'Other'
-  const [wantsCustom,  setWantsCustom]  = useState(null)    // true | false | null
-  const [customPrompt, setCustomPrompt] = useState('')
-  const [currentStep,  setCurrentStep]  = useState(0)
+  const [overrides,    setOverrides]    = useState({})
+  const [guidelineFile, setGuidelineFile] = useState(null)
+  const [customRules,   setCustomRules]   = useState(null)
+  const [extracting,    setExtracting]    = useState(false)
+
+  // Pipeline state
+  const [jobId,        setJobId]        = useState(null)
+
+  // Results state
   const [result,       setResult]       = useState(null)
   const [error,        setError]        = useState('')
-  const [trustScore,   setTrustScore]   = useState(null)    // pre-check score
+  const [trustScore,   setTrustScore]   = useState(null)
   const [downloading,  setDownloading]  = useState(false)
-  const [dlType,       setDlType]       = useState('doc')   // 'pdf' | 'doc'
+  const [dlType,       setDlType]       = useState('doc')
 
-  const handleNav = (target) => {
-    if (target === 'landing') {
-      setView('landing'); setResult(null); setFile(null); setJournal('')
-      setTemplateFile(null); setWantsCustom(null); setCustomPrompt(''); setTrustScore(null)
-    } else setView(target)
+  // ── File upload → POST /upload ──────────────────────────────
+  const handleFileSelect = async (f) => {
+    setFile(f)
+    if (!f) {
+      setDocId(null)
+      setUploadInfo(null)
+      return
+    }
+
+    setUploading(true)
+    try {
+      const formData = new FormData()
+      formData.append('file', f)
+      const res = await axios.post(`${API}/upload`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 30000,
+      })
+      const data = res.data
+      setDocId(data.doc_id)
+      setUploadInfo({
+        filename: data.filename,
+        word_count: data.word_count,
+        char_count: data.char_count,
+        file_type: data.file_type,
+        size_kb: data.size_kb,
+      })
+    } catch (err) {
+      const detail = err.response?.data?.detail
+      const msg = typeof detail === 'object' ? detail.error : detail || err.message
+      setError(msg || 'Upload failed.')
+      setFile(null)
+      setDocId(null)
+      setUploadInfo(null)
+    } finally {
+      setUploading(false)
+    }
   }
 
-  // Step 4: call pre-check → show trust score
+  // ── Extract rules from guideline (full_custom) ─────────────
+  const extractCustomRules = async () => {
+    if (!guidelineFile) return null
+    setExtracting(true)
+    try {
+      const fd = new FormData()
+      fd.append('guideline_file', guidelineFile)
+      const res = await axios.post(`${API}/extract-rules`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 60000,
+      })
+      const rules = res.data.rules
+      setCustomRules(rules)
+      return rules
+    } catch (err) {
+      const detail = err.response?.data?.detail
+      const msg = typeof detail === 'object' ? detail.error : detail || err.message
+      throw new Error(msg || 'Failed to extract rules from guideline.')
+    } finally {
+      setExtracting(false)
+    }
+  }
+
+  // ── Pre-check → POST /score/pre ────────────────────────────
   const handlePreCheck = async () => {
-    if (!file || !journal) return
-    // TODO: replace with real API call → POST /pre-check
-    // Returns { trust_score: number }
-    setTrustScore(72)   // skeleton placeholder
+    if (!docId || !journal) return
     setView('pre-check')
+    setTrustScore(null)
+    try {
+      // For full_custom, extract rules from guideline first
+      let rules = customRules
+      if (selectedMode === 'full_custom' && guidelineFile && !rules) {
+        rules = await extractCustomRules()
+      }
+
+      const formData = new FormData()
+      formData.append('doc_id', docId)
+      formData.append('journal', journal)
+      formData.append('mode', selectedMode)
+      if (selectedMode === 'semi_custom' && Object.keys(overrides).length > 0) {
+        formData.append('overrides', JSON.stringify(overrides))
+      }
+      if (selectedMode === 'full_custom' && rules) {
+        formData.append('custom_rules', JSON.stringify(rules))
+      }
+      const res = await axios.post(`${API}/score/pre`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 30000,
+      })
+      setTrustScore(res.data.pre_format_score)
+    } catch (err) {
+      const detail = err.response?.data?.detail
+      const msg = typeof detail === 'object' ? detail.error : detail || err.message
+      setError(msg || 'Pre-check failed.')
+      setView('error')
+    }
   }
 
-  // Step 5: run full formatting
+  // ── Format → POST /format (kick off, ProgressScreen handles polling) ──
   const handleFormat = async () => {
     setView('loading')
-    setCurrentStep(0)
-    const interval = setInterval(() => setCurrentStep(p => p < PIPELINE_STEPS.length-1 ? p+1 : p), 1500)
+    setError('')
     try {
-      // Hardcoded success timeout instead of API call to avoid backend dependency error
-      setTimeout(() => {
-        clearInterval(interval)
-        setResult({
-          processing_time_seconds: 42,
-          download_url: "/dummy",
-          preview_url: null,
-          compliance_report: {
-            overall_score: 94,
-            breakdown: {
-              "document_format": { "score": 90 },
-              "abstract":        { "score": 75 },
-              "headings":        { "score": 80 },
-              "citations":       { "score": 85 },
-              "references":      { "score": 85 }
-            },
-            changes_made: [
-              "Applied Times New Roman 12pt throughout",
-              "Adjusted margin sizes to 1 inch on all sides",
-              "Fixed heading hierarchy to conform to selected format",
-              "Reformatted citations to match journal guidelines"
-            ]
-          }
-        })
-        setView('success')
-      }, 5000)
+      const formData = new FormData()
+      formData.append('doc_id', docId)
+      formData.append('journal', journal)
+      formData.append('mode', selectedMode)
+      if (selectedMode === 'semi_custom' && Object.keys(overrides).length > 0) {
+        formData.append('overrides', JSON.stringify(overrides))
+      }
+      if (selectedMode === 'full_custom' && customRules) {
+        formData.append('custom_rules', JSON.stringify(customRules))
+      }
+
+      const res = await axios.post(`${API}/format`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 30000,
+      })
+
+      setJobId(res.data.job_id)
     } catch (err) {
-      clearInterval(interval)
-      setError(err.response?.data?.error || 'Pipeline failed. Please try again.')
+      const detail = err.response?.data?.detail || err.response?.data
+      const msg = typeof detail === 'object'
+        ? detail.error || JSON.stringify(detail)
+        : detail || err.message || 'Pipeline failed. Please try again.'
+      setError(msg)
       setView('error')
+    }
+  }
+
+  // Called by ProgressScreen when pipeline completes
+  const handlePipelineComplete = (data) => {
+    setResult(normalizeResult(data))
+    setView('success')
+  }
+
+  const handlePipelineError = (msg) => {
+    setError(msg)
+    setView('error')
+  }
+
+  // Normalize backend response to match what components expect
+  const normalizeResult = (data) => {
+    const report = data.compliance_report || {}
+    if (data.changes_made && data.changes_made.length > 0) {
+      report.changes_made = data.changes_made
+    }
+    const fr = data.formatting_report || {}
+    report.applied_transformations = fr.done || report.changes_made || []
+    report.skipped_transformations = fr.not_done_by_user_choice || []
+    report.manual_action_required = fr.needs_manual_attention || []
+
+    return {
+      processing_time_seconds: data.processing_time_seconds || 0,
+      download_url: data.download_url,
+      preview_url: data.preview_url || null,
+      compliance_report: report,
+      post_format_score: data.post_format_score || null,
     }
   }
 
@@ -442,7 +710,7 @@ export default function App() {
     if (!result?.download_url) return
     setDownloading(true); setDlType(type)
     try {
-      const url  = `http://localhost:8000${result.download_url}${type === 'pdf' ? '?format=pdf' : ''}`
+      const url  = `${API}${result.download_url}${type === 'pdf' ? '?format=pdf' : ''}`
       const res  = await axios.get(url, { responseType:'blob' })
       const mime = type === 'pdf'
         ? 'application/pdf'
@@ -458,15 +726,22 @@ export default function App() {
   }
 
   const resetToTool = () => {
-    setView('tool'); setFile(null); setJournal(''); setResult(null); setError('')
-    setTrustScore(null); setWantsCustom(null); setCustomPrompt(''); setTemplateFile(null)
+    setView('tool'); setFile(null); setDocId(null); setUploadInfo(null)
+    setJournal(''); setResult(null); setError('')
+    setTrustScore(null); setSelectedMode('standard'); setOverrides({})
+    setGuidelineFile(null); setCustomRules(null); setJobId(null)
+  }
+
+  const handleNav = (target) => {
+    if (target === 'landing') {
+      resetToTool()
+      setView('landing')
+    } else setView(target)
   }
 
   const isToolView = ['tool','pre-check','loading','success','error'].includes(view)
-
-  const canSubmit = !!file && !!journal && (
-    journal === 'Other' ? !!templateFile : true
-  )
+  const canSubmit = !!docId && !!journal && !uploading && !extracting
+    && (selectedMode !== 'full_custom' || !!guidelineFile)
 
   return (
     <div className="app">
@@ -475,7 +750,7 @@ export default function App() {
       {/* ── LANDING ── */}
       {view === 'landing' && <Landing onGetStarted={() => setView('tool')} />}
 
-      {/* ── TOOL: Steps 1–3 ── */}
+      {/* ── TOOL: Upload + Mode + Journal + Submit ── */}
       {view === 'tool' && (
         <div className="tool-page">
           <div className="container">
@@ -485,16 +760,55 @@ export default function App() {
             </div>
             <div className="tool-card">
 
-              {/* Step 1: Upload (journal select hidden — handled below) */}
+              {/* Step 1: File Upload */}
               <Upload
-                file={file} setFile={setFile}
+                file={file} setFile={handleFileSelect}
                 journal={journal} setJournal={setJournal}
                 journals={JOURNAL_META.map(j => j.id)}
                 onSubmit={handlePreCheck}
                 hideJournalSelect
               />
 
-              {/* Format selection with last-updated dates */}
+              {/* Upload status indicator */}
+              {uploading && (
+                <div style={{ textAlign:'center', padding:'12px 0', color:'var(--text-secondary)', fontSize:'0.85rem' }}>
+                  <div className="loading-orbit" style={{ width:28, height:28, margin:'0 auto 8px' }}>
+                    <div className="orbit-center" style={{ width:6, height:6 }} />
+                    <div className="orbit-dot" style={{ width:4, height:4 }} />
+                  </div>
+                  Uploading and extracting text...
+                </div>
+              )}
+
+              {/* Upload confirmation */}
+              {uploadInfo && !uploading && (
+                <div style={{
+                  background:'var(--bg-soft)', border:'1.5px solid var(--success)',
+                  borderRadius:'var(--radius)', padding:'12px 16px', marginTop:8,
+                  display:'flex', alignItems:'center', justifyContent:'space-between', gap:12,
+                  fontSize:'0.85rem',
+                }}>
+                  <span style={{ display:'flex', alignItems:'center', gap:8, color:'var(--success)' }}>
+                    {Icons.check} {uploadInfo.filename}
+                  </span>
+                  <span style={{ color:'var(--text-secondary)' }}>
+                    {uploadInfo.word_count.toLocaleString()} words · {uploadInfo.file_type.toUpperCase()} · {uploadInfo.size_kb} KB
+                  </span>
+                </div>
+              )}
+
+              {/* Upload error */}
+              {error && view === 'tool' && (
+                <div style={{
+                  background:'rgba(239,68,68,0.08)', border:'1.5px solid var(--error)',
+                  borderRadius:'var(--radius)', padding:'12px 16px', marginTop:8,
+                  fontSize:'0.85rem', color:'var(--error)',
+                }}>
+                  {error}
+                </div>
+              )}
+
+              {/* Step 2: Journal Selection */}
               <div className="step-box">
                 <label className="form-label" style={{ marginBottom:12, display:'block' }}>Target Format</label>
                 {JOURNAL_META.map(j => (
@@ -507,10 +821,7 @@ export default function App() {
                       <input
                         type="radio" name="journal" value={j.id}
                         checked={journal === j.id}
-                        onChange={() => {
-                          setJournal(j.id)
-                          setWantsCustom(null); setCustomPrompt(''); setTemplateFile(null)
-                        }}
+                        onChange={() => setJournal(j.id)}
                       />
                       <span className="journal-label">{j.label}</span>
                     </span>
@@ -521,53 +832,85 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Other → template upload */}
-              {journal === 'Other' && (
+              {/* Step 3: Mode Selection */}
+              {journal && (
                 <div className="step-box">
-                  <div className="template-upload-title" style={{ marginBottom:6 }}>
-                    {Icons.file} Custom Template Upload
+                  <label className="form-label" style={{ marginBottom:12, display:'block' }}>Formatting Mode</label>
+                  <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+                    {MODES.map(m => (
+                      <button
+                        key={m.id}
+                        className={`yn-btn ${selectedMode === m.id ? 'selected' : ''}`}
+                        onClick={() => setSelectedMode(m.id)}
+                        style={{ flex:1, minWidth:130, textAlign:'center', padding:'10px 14px' }}
+                      >
+                        <div style={{ fontWeight:700, fontSize:'0.88rem' }}>{m.label}</div>
+                        <div style={{ fontSize:'0.72rem', color:'var(--text-secondary)', marginTop:2 }}>{m.desc}</div>
+                      </button>
+                    ))}
                   </div>
-                  <p className="template-upload-hint">
-                    Upload a PDF document that defines the structure for your target format.
-                  </p>
-                  <div className={`template-upload-zone ${templateFile ? 'has-file' : ''}`}>
-                    <input
-                      type="file" accept=".pdf"
-                      onChange={e => setTemplateFile(e.target.files[0] || null)}
-                    />
-                    {templateFile
-                      ? <p className="tuz-filename">✓ {templateFile.name}</p>
-                      : <>
-                          <div style={{ color:'var(--text-muted)', marginBottom:4 }}>{Icons.upload}</div>
-                          <p>Click or drag your PDF template here</p>
-                        </>
-                    }
-                  </div>
-                </div>
-              )}
 
-              {/* Predefined → customization Yes/No */}
-              {journal && journal !== 'Other' && (
-                <div className="step-box">
-                  <div className="custom-prompt-title" style={{ marginBottom:12 }}>Do you want customization?</div>
-                  <div className="custom-yn-row">
-                    <button
-                      className={`yn-btn ${wantsCustom === true  ? 'selected' : ''}`}
-                      onClick={() => setWantsCustom(true)}
-                    >Yes</button>
-                    <button
-                      className={`yn-btn ${wantsCustom === false ? 'selected' : ''}`}
-                      onClick={() => { setWantsCustom(false); setCustomPrompt('') }}
-                    >No</button>
-                  </div>
-                  {wantsCustom === true && (
-                    <textarea
-                      className="prompt-textarea"
-                      placeholder="Describe your customization... e.g. 'Use double-column layout, font size 10pt'"
-                      value={customPrompt}
-                      onChange={e => setCustomPrompt(e.target.value)}
-                      style={{ marginTop:14 }}
-                    />
+                  {/* Semi Custom: Structured override controls */}
+                  {selectedMode === 'semi_custom' && (
+                    <div style={{ marginTop:14 }}>
+                      <SemiCustomPanel
+                        journal={journal}
+                        overrides={overrides}
+                        onChange={setOverrides}
+                      />
+                    </div>
+                  )}
+
+                  {/* Full Custom: Guidelines PDF upload */}
+                  {selectedMode === 'full_custom' && (
+                    <div style={{ marginTop:14 }}>
+                      <label className="form-label" style={{ marginBottom:8, display:'block', fontSize:'0.85rem' }}>
+                        Upload Guidelines Document
+                      </label>
+                      <div
+                        style={{
+                          border:'2px dashed var(--border)', borderRadius:'var(--radius)',
+                          padding:'20px', textAlign:'center', cursor:'pointer',
+                          background: guidelineFile ? 'rgba(34,197,94,0.05)' : 'transparent',
+                          borderColor: guidelineFile ? 'var(--success)' : 'var(--border)',
+                        }}
+                        onClick={() => document.getElementById('guideline-upload')?.click()}
+                      >
+                        <input
+                          id="guideline-upload"
+                          type="file"
+                          accept=".pdf,.docx,.txt"
+                          style={{ display:'none' }}
+                          onChange={(e) => {
+                            const f = e.target.files[0]
+                            if (f) setGuidelineFile(f)
+                          }}
+                        />
+                        {guidelineFile ? (
+                          <div style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}>
+                            <span style={{ color:'var(--success)' }}>{Icons.check}</span>
+                            <span>{guidelineFile.name}</span>
+                            <button
+                              style={{ background:'none', border:'none', color:'var(--error)', cursor:'pointer', fontSize:'0.82rem' }}
+                              onClick={(e) => { e.stopPropagation(); setGuidelineFile(null) }}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <p style={{ margin:0, color:'var(--text-secondary)', fontSize:'0.85rem' }}>
+                              Drop your guidelines PDF/DOCX here, or click to browse
+                            </p>
+                            <div className="format-pills" style={{ marginTop:8, justifyContent:'center' }}>
+                              <span className="format-pill">PDF</span>
+                              <span className="format-pill">DOCX</span>
+                              <span className="format-pill">TXT</span>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
               )}
@@ -586,134 +929,54 @@ export default function App() {
         </div>
       )}
 
-      {/* ── PRE-CHECK: Step 4 — Trust Score ── */}
+      {/* ── PRE-CHECK: Compliance Score with Circular Gauge ── */}
       {view === 'pre-check' && (
         <div className="pre-check-wrap">
           <div className="pre-check-card">
             <span className="pre-check-tag">Compliance Check</span>
-            <h2>Format Compliance Score</h2>
+            <h2>Current Compliance Score</h2>
             <p>
-              Your document was compared against <strong>{journal}</strong> rules.
-              This is your Trust Score <em>before</em> formatting begins.
+              Your document was analyzed against <strong>{journal}</strong> formatting rules.
             </p>
-            <div style={{ margin: '32px 0', textAlign: 'left', background: 'var(--bg-soft)', borderRadius: 'var(--radius)', padding: '24px', border: '1.5px solid var(--border)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '20px' }}>
-                <div>
-                  <h3 style={{ fontSize: '1.15rem', fontWeight: 800, marginBottom: '6px' }}>Estimated Trust Score</h3>
-                  <div className="trust-score-label" style={{ margin: 0 }}>
-                    {trustScore >= 80
-                      ? '✅ Strong compliance — minor fixes needed'
-                      : trustScore >= 60
-                      ? '⚠️ Moderate compliance — several adjustments required'
-                      : '❌ Low compliance — extensive formatting will be applied'}
-                  </div>
+
+            {!trustScore ? (
+              <div style={{ margin: '32px 0', textAlign: 'center', padding: '40px 0' }}>
+                <div className="loading-orbit" style={{ width: 48, height: 48, margin: '0 auto 16px' }}>
+                  <div className="orbit-center" style={{ width: 10, height: 10 }} />
+                  <div className="orbit-dot" style={{ width: 6, height: 6 }} />
                 </div>
-                
-                <div className="h-score-big" style={{ color: trustScore >= 80 ? 'var(--success)' : trustScore >= 60 ? 'var(--orange)' : 'var(--error)' }}>
-                  {trustScore}<span className="h-score-unit">/100</span>
-                </div>
+                <p style={{ color: 'var(--text-secondary)' }}>
+                  {extracting ? 'Extracting rules from your guidelines...' : 'Analyzing your document...'}
+                </p>
               </div>
-            </div>
-            <div className="pre-check-actions">
-              <button
-                className="btn-primary"
-                style={{ width:'auto', padding:'14px 32px', margin: 0 }}
-                onClick={handleFormat}
-              >
-                Start Formatting {Icons.arrow}
-              </button>
-              <button className="btn-secondary" onClick={() => setView('tool')}>
-                ← Edit Selection
-              </button>
-            </div>
+            ) : (
+              <PreCheckGauge trustScore={trustScore} onFormat={handleFormat} onBack={() => setView('tool')} />
+            )}
           </div>
         </div>
       )}
 
-      {/* ── LOADING: Step 5 ── */}
-      {view === 'loading' && (
-        <div className="container">
-          <div className="loading-section">
-            <div className="loading-orbit">
-              <div className="orbit-center" />
-              <div className="orbit-dot" />
-              <div className="orbit-dot d2" />
-              <div className="orbit-dot d3" />
-            </div>
-            <p key={currentStep} className="loading-step-text">{PIPELINE_STEPS[currentStep]}</p>
-            <div className="step-progress">
-              {PIPELINE_STEPS.map((_,i) => <div key={i} className={`step-dot ${i<=currentStep?'active':''}`} />)}
-            </div>
-            <p className="loading-note">Gemini 2.5 Flash is running all 5 formatting agents — please don't close this tab.</p>
-          </div>
-        </div>
+      {/* ── LOADING: Pipeline Progress ── */}
+      {view === 'loading' && jobId && (
+        <ProgressScreen
+          jobId={jobId}
+          journal={journal}
+          filename={uploadInfo?.filename}
+          onComplete={handlePipelineComplete}
+          onError={handlePipelineError}
+        />
       )}
 
-      {/* ── SUCCESS: Step 6 ── */}
+      {/* ── SUCCESS: Results ── */}
       {view === 'success' && result && (
-        <div className="container-wide">
-          <div className="results-wrap">
-            <div className="results-header">
-              <h2>Formatting Complete ✓</h2>
-              <span className="time-badge">Processed in {result.processing_time_seconds}s</span>
-            </div>
-
-            <div className="results-body-horizontal">
-              {/* Left Column: Preview */}
-              <div className="results-left-col">
-                <div className="preview-section" style={{ margin: 0, height: '100%', display: 'flex', flexDirection: 'column' }}>
-                  <h3>{Icons.file} Paper Preview</h3>
-                  <div className="preview-iframe-wrap" style={{ flex: 1, minHeight: 0 }}>
-                    {result.preview_url
-                      ? <iframe
-                          src={`http://localhost:8000${result.preview_url}`}
-                          style={{ width:'100%', height:'100%', border:'none' }}
-                          title="Paper Preview"
-                        />
-                      : <div className="preview-placeholder">
-                          <div className="preview-placeholder-icon">{Icons.file}</div>
-                          <p>Preview will appear here once the backend returns a <code>preview_url</code>.</p>
-                        </div>
-                    }
-                  </div>
-                </div>
-              </div>
-
-              {/* Right Column: Downloads, Score, Report */}
-              <div className="results-right-col">
-                <ComplianceScore report={result.compliance_report} />
-                <TransformationReport report={result.compliance_report} />
-
-                <div className="result-card" style={{ textAlign:'center', marginBottom:20 }}>
-                  <h3 style={{ marginBottom:8 }}>Download Formatted Paper</h3>
-                  <p style={{ fontSize:'0.85rem', color:'var(--text-secondary)', marginBottom:18 }}>Choose your preferred format</p>
-                  <div className="download-row">
-                    <button
-                      className="download-btn-pdf"
-                      onClick={() => handleDownload('pdf')}
-                      disabled={downloading}
-                    >
-                      {Icons.download}
-                      {downloading && dlType==='pdf' ? 'Downloading…' : 'Download PDF'}
-                    </button>
-                    <button
-                      className="download-btn-doc"
-                      onClick={() => handleDownload('doc')}
-                      disabled={downloading}
-                    >
-                      {Icons.download}
-                      {downloading && dlType==='doc' ? 'Downloading…' : 'Download DOC/DOCX'}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div style={{ textAlign:'center', marginTop:28 }}>
-              <button className="btn-secondary" onClick={resetToTool}>Format Another Paper</button>
-            </div>
-          </div>
-        </div>
+        <ResultsScreen
+          result={result}
+          trustScore={trustScore}
+          onDownload={handleDownload}
+          downloading={downloading}
+          dlType={dlType}
+          onReset={resetToTool}
+        />
       )}
 
       {/* ── ERROR ── */}
@@ -731,10 +994,9 @@ export default function App() {
       <footer className="footer">
         <div className="container">
           Built for <span className="accent">HackaMined 2026</span> ·{' '}
-          <span className="accent-blue">Agent Paperpal</span> · Powered by Gemini 2.5 Flash
+          <span className="accent-blue">Agent Paperpal</span> · Powered by Gemini 3 Flash
         </div>
       </footer>
     </div>
   )
 }
-

@@ -54,8 +54,10 @@ def build_apa_docx(transform_output: dict, output_path: str) -> str:
     font = style.font
     font.name = instructions.get("font", "Times New Roman")
     # Support both field names: font_size_halfpoints (MD prompt) and font_size (legacy)
-    raw_size = instructions.get("font_size_halfpoints", instructions.get("font_size", 24))
-    font.size = Pt(raw_size / 2) if raw_size > 13 else Pt(raw_size)
+    if "font_size_halfpoints" in instructions:
+        font.size = Pt(instructions["font_size_halfpoints"] / 2)
+    else:
+        font.size = Pt(instructions.get("font_size", 12))
 
     paragraph_format = style.paragraph_format
     paragraph_format.space_before = Pt(0)
@@ -726,7 +728,12 @@ def _set_columns(doc: Document, columns: int) -> None:
         return
     try:
         section = doc.sections[0]
-        cols = section._sectPr.xpath('./w:cols')[0]
+        cols_list = section._sectPr.xpath('./w:cols')
+        if cols_list:
+            cols = cols_list[0]
+        else:
+            cols = OxmlElement('w:cols')
+            section._sectPr.append(cols)
         cols.set(qn('w:num'), str(columns))
     except Exception as e:
         logger.warning("[DOCX] Could not set columns: %s", e)
@@ -777,8 +784,8 @@ def _apply_line_spacing(pf, line_spacing: float) -> None:
     elif line_spacing == 2.0:
         pf.line_spacing_rule = WD_LINE_SPACING.DOUBLE
     else:
-        pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
-        pf.line_spacing = Pt(line_spacing * 12)
+        pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+        pf.line_spacing = line_spacing
 
 
 def _apply_font(run, font_name: str, font_size: int, bold: bool = False, italic: bool = False) -> None:
@@ -888,9 +895,12 @@ def _add_abstract(doc: Document, text: str, abstract_rules: dict, font_name: str
 
 def _add_keywords(doc: Document, text: str, rules: dict, font_name: str, font_size: int) -> None:
     label = rules.get("keywords_label", "Index Terms—")
+    keywords_italic = rules.get("keywords_italic", False)
     para = doc.add_paragraph()
-    run = para.add_run(label + " " + text)
-    _apply_font(run, font_name, font_size)
+    label_run = para.add_run(label + " ")
+    _apply_font(label_run, font_name, font_size, italic=keywords_italic)
+    text_run = para.add_run(text)
+    _apply_font(text_run, font_name, font_size)
 
 
 def _add_reference(doc: Document, text: str, ref_rules: dict, font_name: str, font_size: int) -> None:
@@ -908,28 +918,28 @@ def _add_figure_caption(doc: Document, text: str, fig_rules: dict, font_name: st
     bold = fig_rules.get("label_bold", True)
     italic = fig_rules.get("caption_italic", False)
     alignment = fig_rules.get("caption_alignment", "center")
-    
+
     if alignment == "center":
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     elif alignment == "left":
         para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        
+
     run = para.add_run(text)
-    _apply_font(run, font_name, font_size - 1, bold=bold, italic=italic)
+    _apply_font(run, font_name, font_size, bold=bold, italic=italic)
 
 
 def _add_table_caption(doc: Document, text: str, tbl_rules: dict, font_name: str, font_size: int) -> None:
     para = doc.add_paragraph()
     bold = tbl_rules.get("label_bold", True)
     alignment = tbl_rules.get("caption_alignment", "center")
-    
+
     if alignment == "center":
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     elif alignment == "left":
         para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        
+
     run = para.add_run(text)
-    _apply_font(run, font_name, font_size - 1, bold=bold)
+    _apply_font(run, font_name, font_size, bold=bold)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

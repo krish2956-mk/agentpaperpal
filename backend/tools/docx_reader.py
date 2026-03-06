@@ -50,7 +50,17 @@ def extract_docx_text(filepath: str) -> str:
 
     for para in doc.paragraphs:
         text = para.text.strip()
-        if text:
+        if not text:
+            parts.append("")  # preserve blank lines for structure detection
+            continue
+        # Preserve heading structure: uppercase heading text + blank line before
+        style_name = para.style.name if para.style else ""
+        is_heading = style_name.lower().startswith("heading") or style_name.lower() in ("title", "subtitle")
+        if is_heading:
+            parts.append("")  # blank line before heading
+            parts.append(text.upper() if not text.isupper() else text)
+            parts.append("")  # blank line after heading
+        else:
             parts.append(text)
 
     for table in doc.tables:

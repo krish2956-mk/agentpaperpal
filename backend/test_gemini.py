@@ -6,7 +6,7 @@ vertexai.init(
     location="us-central1"
 )
 
-model = GenerativeModel("gemini-2.5-flash")
+model = GenerativeModel("ggemini-2.5-flash-lite")
 
 response = model.generate_content(
     "Explain IEEE citation format."

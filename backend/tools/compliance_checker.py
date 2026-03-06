@@ -26,10 +26,11 @@ _CHECK_TO_SECTION = {
     "reference_ordering":    "references",
 }
 
-# Citation format regex patterns — keyed by journal rules.citations.format value
+# Citation format regex patterns — keyed by journal rules.citations.style value
 _CITATION_PATTERNS: dict[str, re.Pattern] = {
-    "numbered":    re.compile(r"^\[?\d+\]?$"),
-    "author_date": re.compile(r"^\(?[A-Z][a-z]+[\w\s\-&,\.]{0,40}\d{4}[a-z]?\)?$"),
+    "numbered":     re.compile(r"^\[?\d+\]?$"),
+    "author_date":  re.compile(r"^\(?[A-Z][a-z]+[\w\s\-&,\.]{0,60}\d{4}[a-z]?\)?$"),
+    "author-date":  re.compile(r"^\(?[A-Z][a-z]+[\w\s\-&,\.]{0,60}\d{4}[a-z]?\)?$"),
 }
 
 
@@ -241,8 +242,9 @@ def _check_citation_format(
     Score = fraction of citations matching the expected pattern × 100.
     A score ≥ 90 is considered passing.
     """
-    citation_format = rules.get("citations", {}).get("format")
-    pattern = _CITATION_PATTERNS.get(citation_format)
+    citations_rules = rules.get("citations", {})
+    citation_format = citations_rules.get("format") or citations_rules.get("style")
+    pattern = _CITATION_PATTERNS.get(citation_format) if citation_format else None
     if not pattern:
         return []  # Unknown format — skip deterministic check
 

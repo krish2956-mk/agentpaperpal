@@ -21,8 +21,10 @@ from agents import (
 )
 from agents.validate_agent import SECTION_WEIGHTS
 from tools.compliance_checker import apply_deterministic_checks, run_deterministic_checks
+from tools.docx_reader import extract_docx_text
 from tools.docx_writer import build_apa_docx, build_ieee_docx, transform_docx_in_place, write_formatted_docx
 from tools.logger import get_logger
+from tools.pre_format_scorer import score_pre_format
 from tools.rule_loader import load_rules
 from tools.tool_errors import (
     DocumentWriteError,
@@ -39,6 +41,10 @@ load_dotenv(override=True)
 # easily exceeds 4096 tokens. Gemini 2.5 Flash supports up to 65535 output tokens.
 import litellm
 litellm.max_tokens = int(os.getenv("GEMINI_MAX_TOKENS", "65536"))
+# Set global litellm request timeout so httpx doesn't use its own (low) default.
+litellm.request_timeout = int(os.getenv("LLM_TIMEOUT", "300"))
+# Retry on transient failures (429, 500, timeout)
+litellm.num_retries = int(os.getenv("LLM_MAX_RETRIES", "3"))
 
 logger = get_logger(__name__)
 
@@ -458,8 +464,8 @@ def _build_section_rules_guide(rules: dict, section_stats: dict) -> str:
     cit_rules = rules.get("citations", {})
     lines += [
         "[IN-TEXT CITATIONS]",
-        f"  format: {cit_rules.get('format', '?')}  "
-        f"(numbered = [1], [2] style  |  author_date = (Smith, 2020) style)",
+        f"  format: {cit_rules.get('style', cit_rules.get('format', '?'))}  "
+        f"(numbered = [1], [2] style  |  author-date = (Smith, 2020) style)",
         f"  et_al_threshold: {cit_rules.get('et_al_threshold', '?')} authors",
     ]
     if cit_rules.get("ibid_allowed") is not None:
@@ -660,25 +666,49 @@ def extract_json_from_llm(raw: str) -> dict:
 
 
 class _StepTimer:
-    """Logs wall-clock duration of each CrewAI task and accumulates stage_times."""
+    """Logs wall-clock duration of each CrewAI task, updates progress callback."""
 
-    def __init__(self) -> None:
+    # Progress percentages after each step completes
+    _STEP_PROGRESS = [20, 40, 75, 95]
+
+    def __init__(self, progress_callback=None) -> None:
         self._step_index = 0
         self._step_start = time.time()
+        self._pipeline_start = time.time()
         self.stage_times: dict = {}
+        self._progress_callback = progress_callback
 
     def on_task_complete(self, output) -> None:
         elapsed = round(time.time() - self._step_start, 2)
+        total_elapsed = round(time.time() - self._pipeline_start, 1)
         name = (
             _STEP_NAMES[self._step_index]
             if self._step_index < len(_STEP_NAMES)
             else f"Step {self._step_index + 1}"
         )
         self.stage_times[name.lower()] = elapsed
-        logger.info(
-            "[PIPELINE] Step %d/4 — %-10s completed in %.2fs",
-            self._step_index + 1, name, elapsed,
+
+        progress = (
+            self._STEP_PROGRESS[self._step_index]
+            if self._step_index < len(self._STEP_PROGRESS)
+            else 95
         )
+
+        logger.info(
+            "[PIPELINE] Step %d/4 — %-10s completed in %.2fs (total: %.1fs, progress: %d%%)",
+            self._step_index + 1, name, elapsed, total_elapsed, progress,
+        )
+
+        # Notify caller (main.py) to update JOB_STORE
+        if self._progress_callback:
+            self._progress_callback(
+                step_index=self._step_index + 1,  # completed step (1-indexed)
+                progress=progress,
+                step_name=name,
+                step_elapsed=elapsed,
+                total_elapsed=total_elapsed,
+            )
+
         self._step_index += 1
         self._step_start = time.time()
 
@@ -743,7 +773,7 @@ def _validate_task_outputs(crew: Crew) -> None:
         logger.debug("[PIPELINE] Task '%s' output validated OK (%d chars)", name, len(raw))
 
 
-def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optional[str] = None) -> dict:
+def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optional[str] = None, rules_override: Optional[dict] = None, progress_callback=None) -> dict:
     """
     Execute the 5-agent CrewAI sequential pipeline.
 
@@ -753,6 +783,8 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         paper_content: Full extracted text from uploaded PDF/DOCX.
         journal_style: One of "APA 7th Edition", "IEEE", "Vancouver",
                        "Springer", "Chicago".
+        rules_override: Pre-merged rules dict (with overrides applied).
+                        If provided, skips load_rules() and uses this directly.
 
     Returns:
         dict with keys:
@@ -796,12 +828,11 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
     # LiteLLM (used internally by CrewAI) reads GOOGLE_API_KEY for Google AI Studio
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
     llm_timeout = int(os.getenv("LLM_TIMEOUT", "300"))
-    
-    # Use high max_tokens to prevent truncation — Gemini 2.5 Flash uses
+
+    # Use high max_tokens to prevent truncation — Gemini Flash uses
     # chain-of-thought "Thought:" tokens that consume output budget.
-    # 65536 is the max for Gemini 2.5 Flash.
     max_tokens = int(os.getenv("GEMINI_MAX_TOKENS", "65536"))
     llm = LLM(
         model=f"gemini/{model_name}",
@@ -811,9 +842,13 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
     )
     logger.info("[PIPELINE] LLM = %s (max_tokens=%d)", model_name, max_tokens)
 
-    logger.info("[PIPELINE] Loading rules for '%s'...", journal_style)
-    rules = load_rules(journal_style)
-    logger.info("[PIPELINE] Rules loaded — %d sections", len(rules))
+    if rules_override:
+        logger.info("[PIPELINE] Using pre-merged rules (with overrides) — %d sections", len(rules_override))
+        rules = rules_override
+    else:
+        logger.info("[PIPELINE] Loading rules for '%s'...", journal_style)
+        rules = load_rules(journal_style)
+        logger.info("[PIPELINE] Rules loaded — %d sections", len(rules))
 
     # ── Pre-pipeline: merge broken PDF lines ─────────────────────────────────
     paper_content = merge_broken_lines(paper_content)
@@ -1062,7 +1097,7 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         context=[transform_task],
     )
 
-    step_timer = _StepTimer()
+    step_timer = _StepTimer(progress_callback=progress_callback)
 
     crew = Crew(
         agents=[ingest_agent, parse_agent, transform_agent, validate_agent],
@@ -1107,16 +1142,19 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
                 logger.error("[PIPELINE] All %d attempts failed. Final error: %s", max_retries + 1, e)
                 raise
 
-    logger.info("[PIPELINE] All steps complete — parsing compliance report...")
+    logger.info("[PIPELINE] All steps complete — parsing outputs...")
+
+    # Parse all task outputs ONCE and reuse throughout
+    parse_raw = _get_task_output(crew, task_index=1)
+    transform_raw = _get_task_output(crew, task_index=2)
+    transform_data = extract_json_from_llm(transform_raw)
+
     compliance_report = _parse_compliance_report(raw_output)
     overall_score = compliance_report.get("overall_score", "N/A")
     logger.info("[PIPELINE] Compliance report parsed — overall_score=%s", overall_score)
 
     # ── Deterministic overrides — replace LLM scores with Python-computed facts ──
-    # Extract paper_structure from parse_task (index 1) to run exact checks.
-    # Any failure here is non-fatal — the LLM scores remain as fallback.
     try:
-        parse_raw = _get_task_output(crew, task_index=1)
         paper_structure = extract_json_from_llm(parse_raw)
         det_checks = run_deterministic_checks(paper_structure, rules)
         if det_checks:
@@ -1134,16 +1172,11 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
             _det_err,
         )
 
-    logger.info("[PIPELINE] Extracting transform output for DOCX generation...")
-    transform_raw = _get_task_output(crew, task_index=2)
-
     # ── Extract interpretation results (PHASE A violations) + enriched changes_made ──
-    # The transform agent runs violation scanning inline (PHASE A) then fixes (PHASE B).
-    # Surface violations for the "Interpret" phase and enrich changes_made with rule refs.
     interpretation_results: dict = {"violations": [], "total_violations": 0}
     enriched_changes: list[dict] = []
     try:
-        _transform_data_preview = extract_json_from_llm(transform_raw)
+        _transform_data_preview = transform_data
 
         # Violations (PHASE A)
         _violations = _transform_data_preview.get("violations", [])
@@ -1192,6 +1225,23 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         "size_kb": round(file_size / 1024, 1),
     }
 
+    # ── Post-format scoring — re-score the output DOCX against same rules ──
+    post_format_score: dict = {}
+    try:
+        output_text = extract_docx_text(str(output_path))
+        post_format_score = score_pre_format(output_text, rules)
+        logger.info(
+            "[PIPELINE] Post-format score: %d (from output DOCX)",
+            post_format_score.get("total_score", -1),
+        )
+    except Exception as _pfs_err:
+        logger.warning("[PIPELINE] Post-format scoring failed (non-fatal): %s", _pfs_err)
+
+    # ── Formatting report — what was done, skipped, needs attention ──────────
+    formatting_report = _build_formatting_report(
+        enriched_changes, interpretation_results, compliance_report,
+    )
+
     logger.info(
         "[PIPELINE] Done — score=%s docx=%s size=%sKB total=%.1fs",
         overall_score, docx_filename, output_metadata["size_kb"], total_elapsed,
@@ -1204,11 +1254,75 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         "pipeline_metrics": pipeline_metrics,
         "interpretation_results": interpretation_results,
         "changes_made": enriched_changes,  # Rule-referenced, from transform PHASE B
+        "post_format_score": post_format_score,
+        "formatting_report": formatting_report,
     }
 
     # Improvement 7: Cache for instant re-runs of identical submissions
     PIPELINE_CACHE[cache_key] = pipeline_result
     return pipeline_result
+
+
+def _build_formatting_report(
+    changes_made: list,
+    interpretation_results: dict,
+    compliance_report: dict,
+) -> dict:
+    """
+    Build a structured formatting report from pipeline artifacts.
+
+    Returns:
+        {
+            "done": [...],                     # auto-applied by formatter
+            "not_done_by_user_choice": [...],   # user override kept
+            "needs_manual_attention": [...]      # system can't touch (images, tables, etc.)
+        }
+    """
+    done: list[str] = []
+    not_done_by_user_choice: list[str] = []
+    needs_manual_attention: list[str] = []
+
+    # ── "done" — from enriched changes_made (transform PHASE B) ──────────
+    for change in changes_made:
+        if isinstance(change, str):
+            done.append(change)
+        elif isinstance(change, dict):
+            desc = change.get("description", change.get("change", str(change)))
+            done.append(str(desc))
+
+    # ── "needs_manual_attention" — from violations that remain unresolved ──
+    # Violations the transform couldn't fix (figures, tables, equations, images)
+    _manual_keywords = {"figure", "table", "image", "equation", "caption", "graph", "chart"}
+    violations = interpretation_results.get("violations", [])
+    for v in violations:
+        text = v if isinstance(v, str) else v.get("description", v.get("issue", str(v)))
+        text_lower = str(text).lower()
+        if any(kw in text_lower for kw in _manual_keywords):
+            needs_manual_attention.append(str(text))
+
+    # Also check compliance_report breakdown for low-scoring visual sections
+    breakdown = compliance_report.get("breakdown", {})
+    for section_key in ("figures", "tables"):
+        section = breakdown.get(section_key, {})
+        if isinstance(section, dict):
+            score = section.get("score", 100)
+            issues = section.get("issues", [])
+            if isinstance(score, (int, float)) and score < 80:
+                for issue in issues:
+                    issue_str = str(issue)
+                    if issue_str not in needs_manual_attention:
+                        needs_manual_attention.append(issue_str)
+
+    logger.info(
+        "[PIPELINE] Formatting report: done=%d skipped=%d manual=%d",
+        len(done), len(not_done_by_user_choice), len(needs_manual_attention),
+    )
+
+    return {
+        "done": done,
+        "not_done_by_user_choice": not_done_by_user_choice,
+        "needs_manual_attention": needs_manual_attention,
+    }
 
 
 def _get_task_output(crew: Crew, task_index: int) -> str:
