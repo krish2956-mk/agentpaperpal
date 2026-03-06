@@ -1987,3 +1987,148 @@ input, select { font-family: var(--font); }
 @media (max-width: 640px) {
   .scp-grid { grid-template-columns: 1fr; }
 }
+
+/* ============================================================
+   LIVE DOCUMENT EDITOR
+============================================================ */
+.live-editor-container {
+  height: 100%;
+  overflow-y: auto;
+  padding: 16px 0;
+  background: #f1f5f9;
+  border-radius: var(--radius-sm);
+  display: flex;
+  justify-content: center;
+}
+
+.tiptap-editor {
+  background: #fff;
+  padding: 48px 64px;
+  width: 100%;
+  max-width: 850px;
+  min-height: 100%;
+  box-shadow: var(--shadow-sm);
+  color: #000;
+  line-height: 2;
+  font-family: 'Times New Roman', Times, serif;
+  font-size: 1.1rem;
+}
+
+.tiptap-editor .ProseMirror:focus {
+  outline: none;
+}
+
+.tiptap-editor h1 {
+  text-align: center;
+  font-size: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.tiptap-editor h2 {
+  font-size: 1.25rem;
+  margin-top: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.tiptap-editor p {
+  margin-bottom: 1rem;
+}
+
+.violation-mark {
+  background-color: #fef08a; /* yellow-200 */
+  border-bottom: 2px dashed #ef4444; /* red-500 */
+  cursor: pointer;
+  transition: background-color 0.2s;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+.violation-mark:hover {
+  background-color: #fca5a5; /* red-300 */
+}
+
+/* Tippy Popup Styling */
+.violation-popup {
+  padding: 12px;
+  font-family: var(--font);
+  color: var(--text);
+  min-width: 250px;
+  max-width: 320px;
+}
+
+.v-header {
+  color: var(--error);
+  font-weight: 700;
+  margin-bottom: 6px;
+  font-size: 0.95rem;
+}
+
+.v-rule {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--orange);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.v-message {
+  font-size: 0.85rem;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+}
+
+.v-expected {
+  background: var(--bg-soft);
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.v-old {
+  text-decoration: line-through;
+  color: var(--error);
+  font-weight: 600;
+}
+
+.v-new {
+  color: var(--success);
+  font-weight: 700;
+}
+
+.v-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.v-btn-fix, .v-btn-ignore {
+  flex: 1;
+  padding: 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.v-btn-fix {
+  background: var(--success);
+  color: white;
+}
+
+.v-btn-fix:hover {
+  background: #059669;
+}
+
+.v-btn-ignore {
+  background: var(--bg-muted);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
+.v-btn-ignore:hover {
+  background: #e2e8f0;
+}

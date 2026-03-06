@@ -92,10 +92,12 @@ def _run_pipeline_job(
     journal: str,
     job_id: str,
     fidelity_warnings: list,
+    mode: str = "standard",
     source_docx_path: Optional[str] = None,
     overrides: Optional[str] = None,
     custom_rules: Optional[str] = None,
     source_file_path: Optional[str] = None,
+    **kwargs,
 ) -> None:
     """
     Background worker for async pipeline processing.
@@ -124,22 +126,24 @@ def _run_pipeline_job(
         JOB_STORE[job_id]["step_index"] = 0
         JOB_STORE[job_id]["step_name"] = "INGEST"
 
-        # Apply overrides or custom rules before pipeline runs
-        rules_override = None
-        if custom_rules and custom_rules.strip():
-            # Full Custom mode: use LLM-extracted rules directly
-            try:
-                rules_override = json.loads(custom_rules)
-                logger.info("[JOB:%s] Full Custom rules applied — style=%s",
-                            job_id, rules_override.get("style_name", "Custom"))
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("[JOB:%s] Invalid custom_rules JSON, falling back to journal rules", job_id)
-        elif overrides and overrides.strip():
-            # Semi Custom mode: merge overrides into base journal rules
-            merged = _apply_overrides(load_rules(journal), overrides)
-            if merged is not None:
-                rules_override = merged
-                logger.info("[JOB:%s] Semi Custom overrides applied to rules", job_id)
+        # Use central RuleEngine to prepare final ruleset
+        from engine.rule_engine import generate_rules
+        
+        # Determine mode: standard, semi, full
+        engine_mode = "standard"
+        if mode == "semi_custom":
+            engine_mode = "semi"
+        elif mode == "full_custom":
+            engine_mode = "full"
+            
+        rules_override = generate_rules(
+            mode=engine_mode,
+            journal=journal,
+            overrides=json.loads(overrides) if overrides and overrides.strip() else None,
+            custom_rules=json.loads(custom_rules) if custom_rules and custom_rules.strip() else None,
+            guideline_pdf_bytes=kwargs.get("guideline_pdf_bytes")
+        )
+        logger.info("[JOB:%s] Rules prepared using RuleEngine — mode=%s", job_id, engine_mode)
 
         result = run_pipeline(
             paper_text, journal,
@@ -171,6 +175,7 @@ def _run_pipeline_job(
                 "fidelity_warnings": fidelity_warnings,
                 "post_format_score": result.get("post_format_score", {}),
                 "formatting_report": result.get("formatting_report", {}),
+                "document_structure": result.get("document_structure", {}),
             },
         }
     except Exception as e:
@@ -372,32 +377,22 @@ def _get_fidelity_warnings(ext: str) -> list:
 def _apply_overrides(rules: dict, overrides: str) -> dict:
     """
     Apply Semi Custom structured overrides to journal rules.
-
-    Accepts a JSON string of structured overrides (e.g. {"document": {"font": "Arial"}})
-    and merges validated fields into the rules dict.
+    Leverages RuleEngine.generate_rules for robustness.
     """
     if not overrides or not overrides.strip():
         return rules
 
     try:
         overrides_json = json.loads(overrides)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("[OVERRIDES] Invalid JSON in overrides, ignoring: %s", overrides[:100])
+        from engine.rule_engine import generate_rules
+        return generate_rules(
+            mode="semi",
+            journal=rules.get("style_name", "Standard"),
+            overrides=overrides_json
+        )
+    except Exception as e:
+        logger.warning("[OVERRIDES] Failed to apply overrides: %s", e)
         return rules
-
-    if not isinstance(overrides_json, dict):
-        return rules
-
-    rules = json.loads(json.dumps(rules))  # deep copy
-
-    # Validate and apply only allowed fields
-    applied, _blocked, _errors = _validate_overrides(overrides_json)
-    for item in applied:
-        section, field = item["field"].split(".", 1)
-        rules.setdefault(section, {})[field] = item["value"]
-
-    logger.info("[OVERRIDES] Applied structured overrides")
-    return rules
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +417,27 @@ OVERRIDE_SCHEMA = {
         "type": "enum_float",
         "values": [1.0, 1.15, 1.5, 2.0],
         "label": "Line Spacing",
+    },
+    "document.alignment": {
+        "type": "enum",
+        "values": ["left", "justify", "center", "right"],
+        "label": "Alignment",
+    },
+    "document.margins.top": {
+        "type": "string",
+        "label": "Margin Top",
+    },
+    "document.margins.bottom": {
+        "type": "string",
+        "label": "Margin Bottom",
+    },
+    "document.margins.left": {
+        "type": "string",
+        "label": "Margin Left",
+    },
+    "document.margins.right": {
+        "type": "string",
+        "label": "Margin Right",
     },
     "headings.numbering_style": {
         "type": "enum",
@@ -783,10 +799,19 @@ async def get_journal_defaults(journal: str) -> JSONResponse:
         })
 
     rules = load_rules(journal)
+    
+    def get_nested(d, path):
+        keys = path.split(".")
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict) or k not in cur:
+                return None
+            cur = cur[k]
+        return cur
+
     defaults = {}
     for dotted in OVERRIDE_SCHEMA:
-        section, field = dotted.split(".", 1)
-        val = rules.get(section, {}).get(field)
+        val = get_nested(rules, dotted)
         if val is not None:
             defaults[dotted] = val
 
@@ -794,9 +819,6 @@ async def get_journal_defaults(journal: str) -> JSONResponse:
         "journal": journal,
         "style_name": rules.get("style_name", journal),
         "defaults": defaults,
-        "schema": {k: {"label": v["label"], "type": v["type"],
-                        "values": v.get("values"), "min": v.get("min"), "max": v.get("max")}
-                   for k, v in OVERRIDE_SCHEMA.items()},
     })
 
 
@@ -918,26 +940,10 @@ async def format_document(
         })
 
     # ── Handle full_custom guideline PDF ──────────────────────────────────
-    guideline_text = None
+    guideline_pdf_bytes = None
     if mode == "full_custom" and guideline_pdf:
-        gl_ext = _get_extension(guideline_pdf.filename or "")
-        if gl_ext not in ("pdf", "docx", "txt"):
-            raise HTTPException(status_code=422, detail={
-                "success": False,
-                "error": "Guideline file must be PDF, DOCX, or TXT.",
-                "step": "validation",
-            })
-        gl_content = await guideline_pdf.read()
-        gl_path = UPLOADS_DIR / f"{job_id}_guideline.{gl_ext}"
-        try:
-            gl_path.write_bytes(gl_content)
-            guideline_text = _extract_text(str(gl_path), gl_ext)
-            logger.info("[FORMAT:%s] Guideline PDF extracted — %d chars", job_id, len(guideline_text))
-        except Exception as e:
-            logger.warning("[FORMAT:%s] Guideline extraction failed: %s", job_id, e)
-        finally:
-            if gl_path.exists():
-                gl_path.unlink(missing_ok=True)
+        guideline_pdf_bytes = await guideline_pdf.read()
+        logger.info("[FORMAT:%s] Guideline PDF received (%d bytes)", job_id, len(guideline_pdf_bytes))
 
     # ── Fidelity warnings ─────────────────────────────────────────────────
     fidelity_warnings = _get_fidelity_warnings(ext)
@@ -960,10 +966,12 @@ async def format_document(
     background_tasks.add_task(
         _run_pipeline_job,
         paper_text, journal, job_id, fidelity_warnings,
+        mode=mode,
         source_docx_path=source_docx_path,
         overrides=overrides,
         custom_rules=custom_rules,
         source_file_path=source_file_path,
+        guideline_pdf_bytes=guideline_pdf_bytes,
     )
 
     return JSONResponse(
@@ -1111,10 +1119,24 @@ async def get_format_result(job_id: str) -> JSONResponse:
 # GET /download/{filename} — Download formatted DOCX or PDF
 # ---------------------------------------------------------------------------
 def _convert_docx_to_pdf(docx_path: Path) -> Path:
-    """Convert DOCX to PDF using LibreOffice headless. Returns path to PDF."""
+    """Convert DOCX to PDF using LibreOffice headless or docx2pdf. Returns path to PDF."""
     pdf_path = docx_path.with_suffix(".pdf")
     if pdf_path.exists():
         return pdf_path
+
+    import sys
+    if sys.platform == "win32":
+        try:
+            from docx2pdf import convert
+            convert(str(docx_path), str(pdf_path))
+            if pdf_path.exists():
+                logger.info("[PDF] Converted %s → %s via docx2pdf", docx_path.name, pdf_path.name)
+                return pdf_path
+        except ImportError:
+            logger.warning("[PDF] docx2pdf not installed. Falling back to LibreOffice.")
+        except Exception as e:
+            logger.warning("[PDF] docx2pdf conversion failed: %s. Falling back to LibreOffice.", str(e))
+
     try:
         result = subprocess.run(
             ["libreoffice", "--headless", "--convert-to", "pdf",
@@ -1129,7 +1151,10 @@ def _convert_docx_to_pdf(docx_path: Path) -> Path:
         logger.info("[PDF] Converted %s → %s", docx_path.name, pdf_path.name)
         return pdf_path
     except FileNotFoundError:
-        raise RuntimeError("LibreOffice not installed. Cannot convert to PDF.")
+        msg = "LibreOffice not installed. Cannot convert to PDF."
+        if sys.platform == "win32":
+            msg += " Make sure docx2pdf and Microsoft Word are installed."
+        raise RuntimeError(msg)
     except subprocess.TimeoutExpired:
         raise RuntimeError("PDF conversion timed out.")
 

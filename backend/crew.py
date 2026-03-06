@@ -834,7 +834,7 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
     # LiteLLM (used internally by CrewAI) reads GOOGLE_API_KEY for Google AI Studio
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     llm_timeout = int(os.getenv("LLM_TIMEOUT", "300"))
 
     # Use high max_tokens to prevent truncation — Gemini Flash uses
@@ -1166,8 +1166,6 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
                 raise
 
     logger.info("[PIPELINE] All steps complete — parsing outputs...")
-
-    # Parse all task outputs ONCE and reuse throughout
     parse_raw = _get_task_output(crew, task_index=1)
     transform_raw = _get_task_output(crew, task_index=2)
     transform_data = extract_json_from_llm(transform_raw)
@@ -1225,14 +1223,35 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         # Violations (PHASE A)
         _violations = _transform_data_preview.get("violations", [])
         if isinstance(_violations, list):
+            structured_violations = []
+            for i, v in enumerate(_violations):
+                if not isinstance(v, dict):
+                    v = {"text": str(v), "message": str(v)}
+                
+                v_text = v.get("text", v.get("current", ""))
+                start_char = paper_content.find(v_text) if v_text else -1
+                end_char = start_char + len(v_text) if start_char != -1 else -1
+
+                structured_violations.append({
+                    "id": f"v{i+1}",
+                    "element": v.get("element", ""),
+                    "text": v_text,
+                    "start_char": start_char,
+                    "end_char": end_char,
+                    "message": v.get("message", "Formatting violation"),
+                    "expected": v.get("expected", v.get("required", "")),
+                    "rule_reference": v.get("rule_reference", v.get("apa_ref", "")),
+                    "severity": v.get("severity", "medium")
+                })
+            
             interpretation_results = {
-                "violations": _violations,
-                "total_violations": len(_violations),
+                "violations": structured_violations,
+                "total_violations": len(structured_violations),
                 "journal": journal_style,
             }
             logger.info(
                 "[PIPELINE] Interpretation results extracted — %d violations surfaced",
-                len(_violations),
+                len(structured_violations),
             )
 
         # Changes made (PHASE B) — enrich with rule references
@@ -1294,6 +1313,15 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         overall_score, docx_filename, output_metadata["size_kb"], total_elapsed,
     )
 
+    # ── Extract parsed structure for the Live Document Editor  ───────────────
+    document_structure = {}
+    try:
+        parse_raw = _get_task_output(crew, task_index=1)
+        document_structure = extract_json_from_llm(parse_raw)
+        logger.info("[PIPELINE] Extracted parsed document structure from Agent 2")
+    except Exception as e:
+        logger.warning("[PIPELINE] Could not extract parsed document structure: %s", e)
+
     pipeline_result = {
         "compliance_report": compliance_report,
         "docx_filename": docx_filename,
@@ -1303,6 +1331,7 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         "changes_made": enriched_changes,  # Rule-referenced, from transform PHASE B
         "post_format_score": post_format_score,
         "formatting_report": formatting_report,
+        "document_structure": document_structure,
     }
 
     # Improvement 7: Cache for instant re-runs of identical submissions
