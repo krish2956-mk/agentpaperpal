@@ -16,6 +16,10 @@ backend/.env
 frontend/.env
 .env
 
+# Service account credentials
+**/service-account*.json
+**/project-*.json
+
 # Uploaded/generated files
 backend/uploads/
 backend/outputs/

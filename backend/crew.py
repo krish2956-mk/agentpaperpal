@@ -38,7 +38,7 @@ load_dotenv(override=True)
 # The TRANSFORM agent outputs full paper content as structured JSON which
 # easily exceeds 4096 tokens. Gemini 2.5 Flash supports up to 65535 output tokens.
 import litellm
-litellm.max_tokens = 16384
+litellm.max_tokens = int(os.getenv("GEMINI_MAX_TOKENS", "65536"))
 
 logger = get_logger(__name__)
 
@@ -685,43 +685,61 @@ class _StepTimer:
 
 def _validate_task_outputs(crew: Crew) -> None:
     """
-    Central pipeline guard — validate all 5 task outputs after crew.kickoff().
+    Central pipeline guard — validate all task outputs after crew.kickoff().
 
-    Checks each task produced meaningful output with required keys.
-    Raises TransformError immediately on any failure to surface silent CrewAI failures.
+    For JSON steps (parse, transform, validate), uses extract_json_from_llm()
+    to properly strip chain-of-thought preamble before checking required keys.
+    Raises TransformError immediately on any failure.
     """
-    validations = [
-        (0, "ingest",    lambda o: bool(o and o.strip())),
-        (1, "parse",     lambda o: '"sections"' in o or "'sections'" in o),
-        (2, "transform", lambda o: '"docx_instructions"' in o or "'docx_instructions'" in o),
-        (3, "validate",  lambda o: '"overall_score"' in o or "'overall_score'" in o),
-    ]
-
-    import json
     import uuid
     from pathlib import Path
-    
+
     # Save intermediate outputs to outputs/ folder for debugging
     run_id = uuid.uuid4().hex[:6]
     outputs_dir = Path(__file__).parent / "outputs"
     outputs_dir.mkdir(exist_ok=True)
 
-    for idx, name, check in validations:
+    # Step 0: ingest — just needs non-empty text output
+    # Steps 1-3: need valid JSON with specific keys
+    json_validations = [
+        (1, "parse",     "sections"),
+        (2, "transform", "docx_instructions"),
+        (3, "validate",  "overall_score"),
+    ]
+
+    for idx in range(4):
+        name = ["ingest", "parse", "transform", "validate"][idx]
         try:
             raw = _get_task_output(crew, idx)
-            # Save raw output
             debug_path = outputs_dir / f"intermediate_{run_id}_{idx+1}_{name}.txt"
             with open(debug_path, "w", encoding="utf-8") as f:
                 f.write(raw)
-                
         except TransformError as e:
             raise TransformError(f"Pipeline task '{name}' (step {idx + 1}) produced no output: {e}")
-        if not check(raw):
-            snippet = (raw[:200] + "...") if len(raw) > 200 else raw
-            raise TransformError(
-                f"Pipeline task '{name}' (step {idx + 1}) failed validation. "
-                f"Output snippet: {snippet!r}"
-            )
+
+        if idx == 0:
+            # Ingest: just check non-empty
+            if not raw or not raw.strip():
+                raise TransformError(
+                    f"Pipeline task 'ingest' (step 1) produced empty output."
+                )
+        else:
+            # JSON steps: extract JSON properly (strips Thought: preamble)
+            _, _, required_key = next(v for v in json_validations if v[0] == idx)
+            try:
+                parsed = extract_json_from_llm(raw)
+            except LLMResponseError as e:
+                snippet = (raw[:200] + "...") if len(raw) > 200 else raw
+                raise TransformError(
+                    f"Pipeline task '{name}' (step {idx + 1}) failed JSON extraction: {e}. "
+                    f"Output snippet: {snippet!r}"
+                )
+            if required_key not in parsed:
+                raise TransformError(
+                    f"Pipeline task '{name}' (step {idx + 1}) missing required key "
+                    f"'{required_key}'. Keys found: {list(parsed.keys())}"
+                )
+
         logger.debug("[PIPELINE] Task '%s' output validated OK (%d chars)", name, len(raw))
 
 
@@ -781,14 +799,17 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
     model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     llm_timeout = int(os.getenv("LLM_TIMEOUT", "300"))
     
-    # Improvement 12: Use structured LLM object with high max_tokens to prevent truncation
+    # Use high max_tokens to prevent truncation — Gemini 2.5 Flash uses
+    # chain-of-thought "Thought:" tokens that consume output budget.
+    # 65536 is the max for Gemini 2.5 Flash.
+    max_tokens = int(os.getenv("GEMINI_MAX_TOKENS", "65536"))
     llm = LLM(
         model=f"gemini/{model_name}",
         timeout=llm_timeout,
         temperature=0,
-        max_tokens=16384, # High limit for large docx_instructions
+        max_tokens=max_tokens,
     )
-    logger.info("[PIPELINE] LLM = %s (max_tokens=16384)", model_name)
+    logger.info("[PIPELINE] LLM = %s (max_tokens=%d)", model_name, max_tokens)
 
     logger.info("[PIPELINE] Loading rules for '%s'...", journal_style)
     rules = load_rules(journal_style)
@@ -1051,8 +1072,8 @@ def run_pipeline(paper_content: str, journal_style: str, source_docx_path: Optio
         task_callback=step_timer.on_task_complete,
     )
 
-    # Improvement 11: Single attempt for faster feedback
-    max_retries = 0
+    # Allow one retry on validation failures (e.g. LLM chain-of-thought issues)
+    max_retries = 1
     last_error = None
 
     for attempt in range(max_retries + 1):
