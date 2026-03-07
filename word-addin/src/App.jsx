@@ -9,8 +9,6 @@ import ErrorBanner from "./components/ErrorBanner";
 import { uploadDocument, startFormat, pollUntilDone, getResult, downloadDocx } from "./utils/api";
 import { getDocumentAsBlob, getDocumentText, insertDocx, isOfficeReady } from "./utils/office";
 
-// IDLE → UPLOADING → FORMATTING → POLLING → RESULTS
-// Any stage can → ERROR → IDLE
 const STATES = {
   IDLE: "idle",
   UPLOADING: "uploading",
@@ -20,6 +18,27 @@ const STATES = {
   APPLYING: "applying",
   ERROR: "error",
 };
+
+const IconLogo = () => (
+  <svg width="20" height="20" fill="none" viewBox="0 0 24 24">
+    <rect x="4" y="2" width="16" height="20" rx="3" fill="currentColor" opacity="0.15" />
+    <path d="M8 7h8M8 11h8M8 15h5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
+
+const IconDownload = () => (
+  <svg width="16" height="16" fill="none" viewBox="0 0 24 24">
+    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    <polyline points="7 10 12 15 17 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    <line x1="12" y1="15" x2="12" y2="3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+  </svg>
+);
+
+const IconCheck = () => (
+  <svg width="16" height="16" fill="none" viewBox="0 0 24 24">
+    <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
 
 export default function App() {
   const [journal, setJournal] = useState("");
@@ -53,7 +72,6 @@ export default function App() {
     const officeAvailable = isOfficeReady();
 
     try {
-      // --- Upload ---
       setState(STATES.UPLOADING);
       setProgress(0);
       setStage("Reading document");
@@ -75,13 +93,11 @@ export default function App() {
       setProgress(10);
       const { doc_id } = await uploadDocument(blob, "document.docx");
 
-      // --- Start format ---
       setState(STATES.FORMATTING);
       setStage("Starting pipeline");
       setProgress(20);
       const { job_id } = await startFormat(doc_id, journal);
 
-      // --- Poll ---
       setState(STATES.POLLING);
       const controller = new AbortController();
       abortRef.current = controller;
@@ -90,13 +106,12 @@ export default function App() {
         job_id,
         (statusData) => {
           const p = statusData.progress || 0;
-          setProgress(20 + Math.round(p * 0.7)); // 20-90%
+          setProgress(20 + Math.round(p * 0.7));
           setStage(statusData.step || statusData.message || "Processing");
         },
         controller.signal
       );
 
-      // --- Get results ---
       setProgress(95);
       setStage("Fetching results");
 
@@ -187,86 +202,193 @@ export default function App() {
     result?.compliance_report || result?.result?.compliance_report || null;
 
   return (
-    <div className="flex min-h-screen flex-col bg-gray-950 p-4 text-gray-100">
-      {/* Header */}
-      <div className="mb-6">
-        <h1 className="text-lg font-bold text-white">Agent Paperpal</h1>
-        <p className="text-xs text-gray-400">
-          Format your manuscript to any journal style
-        </p>
+    <div style={{
+      minHeight: "100vh", background: "var(--bg-soft)",
+      fontFamily: "var(--font)",
+      display: "flex", flexDirection: "column",
+    }}>
+      {/* Navbar */}
+      <div style={{
+        background: "rgba(255,255,255,0.9)", backdropFilter: "blur(16px)",
+        borderBottom: "1px solid var(--border)",
+        padding: "0 20px", height: 56,
+        display: "flex", alignItems: "center", gap: 10,
+        position: "sticky", top: 0, zIndex: 100,
+      }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 8,
+          background: "linear-gradient(135deg, var(--orange), var(--orange-hover))",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          boxShadow: "0 3px 10px rgba(249,115,22,0.3)",
+          color: "#fff",
+        }}>
+          <IconLogo />
+        </div>
+        <div>
+          <span style={{ fontSize: "0.95rem", fontWeight: 800, color: "var(--text)", letterSpacing: "-0.3px" }}>
+            Agent Paperpal
+          </span>
+        </div>
+        <div style={{
+          marginLeft: "auto",
+          fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.5px",
+          color: "var(--orange)", background: "var(--orange-light)",
+          border: "1px solid rgba(249,115,22,0.2)",
+          borderRadius: "var(--radius-pill)", padding: "3px 10px",
+        }}>
+          WORD ADD-IN
+        </div>
       </div>
 
-      <div className="flex flex-1 flex-col gap-4">
-        {/* Journal selector — always visible */}
-        <JournalSelector
-          value={journal}
-          onChange={setJournal}
-          disabled={isWorking}
-        />
-
-        {/* Idle state — show format button */}
-        {(state === STATES.IDLE || state === STATES.ERROR) && (
-          <FormatButton
-            onClick={handleFormat}
-            disabled={!journal}
-            loading={false}
+      {/* Content */}
+      <div style={{
+        flex: 1, padding: "24px 20px",
+        maxWidth: 400, margin: "0 auto", width: "100%",
+      }}>
+        {/* Card */}
+        <div style={{
+          background: "#fff", border: "1px solid var(--border)",
+          borderRadius: "var(--radius)", padding: "28px 24px",
+          boxShadow: "var(--shadow-lg)",
+          animation: "fadeUp 0.5s ease",
+        }}>
+          {/* Journal selector — always visible */}
+          <JournalSelector
+            value={journal}
+            onChange={setJournal}
+            disabled={isWorking}
           />
-        )}
 
-        {/* Working states — show progress */}
+          {/* Idle / Error — show format button */}
+          {(state === STATES.IDLE || state === STATES.ERROR) && (
+            <FormatButton
+              onClick={handleFormat}
+              disabled={!journal}
+              loading={false}
+            />
+          )}
+
+          {/* Error banner */}
+          {state === STATES.ERROR && (
+            <div style={{ marginTop: 16 }}>
+              <ErrorBanner message={error} onRetry={reset} />
+            </div>
+          )}
+        </div>
+
+        {/* Working states — progress card */}
         {isWorking && (
-          <>
+          <div style={{ marginTop: 16 }}>
             <ProgressBar progress={progress} stage={stage} />
             <button
               onClick={reset}
-              className="text-xs text-gray-500 hover:text-gray-300"
+              style={{
+                display: "block", margin: "12px auto 0",
+                background: "transparent", border: "none",
+                fontSize: "0.8rem", fontWeight: 500,
+                color: "var(--text-muted)", cursor: "pointer",
+                fontFamily: "var(--font)",
+                transition: "color 0.2s",
+              }}
+              onMouseEnter={(e) => e.target.style.color = "var(--text)"}
+              onMouseLeave={(e) => e.target.style.color = "var(--text-muted)"}
             >
               Cancel
             </button>
-          </>
-        )}
-
-        {/* Error */}
-        {state === STATES.ERROR && (
-          <ErrorBanner message={error} onRetry={reset} />
+          </div>
         )}
 
         {/* Results */}
         {state === STATES.RESULTS && (
-          <div className="space-y-4">
-            <div className="rounded-lg border border-gray-800 bg-gray-900 p-4">
+          <div style={{ marginTop: 16, animation: "fadeUp 0.5s ease" }}>
+            {/* Score card */}
+            <div style={{
+              background: "#fff", border: "1px solid var(--border)",
+              borderRadius: "var(--radius)", padding: "28px 24px",
+              boxShadow: "var(--shadow-lg)",
+            }}>
               <ComplianceReport report={complianceReport} />
             </div>
 
             {/* Action buttons */}
-            <div className="space-y-2">
+            <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+              {/* Apply to Document */}
               {isOfficeReady() && !applied && (
                 <button
                   onClick={handleApply}
-                  className="w-full rounded-lg bg-green-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-green-500"
+                  style={{
+                    width: "100%", padding: "13px",
+                    background: "linear-gradient(135deg, var(--success), #059669)",
+                    color: "#fff", border: "none",
+                    borderRadius: "var(--radius-sm)",
+                    fontSize: "0.92rem", fontWeight: 700,
+                    fontFamily: "var(--font)", cursor: "pointer",
+                    boxShadow: "0 6px 20px rgba(16,185,129,0.3)",
+                    display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                    transition: "transform 0.2s, box-shadow 0.2s",
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; }}
                 >
+                  <IconCheck />
                   Apply to Document
                 </button>
               )}
 
+              {/* Success message */}
               {applied && (
-                <div className="rounded-lg border border-green-800 bg-green-950/50 p-3 text-center text-sm text-green-300">
-                  Document updated successfully!
+                <div style={{
+                  background: "var(--success-bg)",
+                  border: "1px solid rgba(16,185,129,0.25)",
+                  borderRadius: "var(--radius-sm)", padding: "12px 16px",
+                  textAlign: "center", animation: "fadeUp 0.3s ease",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                    <div style={{ color: "var(--success)" }}><IconCheck /></div>
+                    <span style={{ fontSize: "0.88rem", fontWeight: 600, color: "var(--success)" }}>
+                      Document updated successfully!
+                    </span>
+                  </div>
                 </div>
               )}
 
+              {/* Download DOCX */}
               <button
                 onClick={handleDownload}
-                className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2.5 text-sm font-medium text-gray-200 transition hover:bg-gray-700"
+                style={{
+                  width: "100%", padding: "13px",
+                  background: "linear-gradient(135deg, var(--orange), #EA6C0A)",
+                  color: "#fff", border: "none",
+                  borderRadius: "var(--radius-pill)",
+                  fontSize: "0.92rem", fontWeight: 700,
+                  fontFamily: "var(--font)", cursor: "pointer",
+                  boxShadow: "0 6px 20px rgba(249,115,22,0.3)",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                  transition: "transform 0.2s, box-shadow 0.2s",
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 10px 28px rgba(249,115,22,0.4)"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "0 6px 20px rgba(249,115,22,0.3)"; }}
               >
+                <IconDownload />
                 Download DOCX
               </button>
 
+              {/* Format Again */}
               <button
                 onClick={reset}
-                className="w-full text-xs text-gray-500 hover:text-gray-300"
+                style={{
+                  width: "100%", padding: "11px",
+                  background: "var(--bg-muted)", color: "var(--text-secondary)",
+                  border: "1.5px solid var(--border)",
+                  borderRadius: "var(--radius-pill)",
+                  fontSize: "0.88rem", fontWeight: 600,
+                  fontFamily: "var(--font)", cursor: "pointer",
+                  transition: "background 0.2s, color 0.2s, border-color 0.2s",
+                }}
+                onMouseEnter={(e) => { e.target.style.borderColor = "var(--orange)"; e.target.style.color = "var(--orange)"; e.target.style.background = "var(--orange-light)"; }}
+                onMouseLeave={(e) => { e.target.style.borderColor = "var(--border)"; e.target.style.color = "var(--text-secondary)"; e.target.style.background = "var(--bg-muted)"; }}
               >
-                Format Again
+                Format Another Paper
               </button>
             </div>
           </div>
@@ -274,7 +396,12 @@ export default function App() {
       </div>
 
       {/* Footer */}
-      <div className="mt-6 border-t border-gray-800 pt-3 text-center text-[10px] text-gray-600">
+      <div style={{
+        borderTop: "1px solid var(--border)",
+        padding: "12px 20px", textAlign: "center",
+        fontSize: "0.7rem", fontWeight: 500,
+        color: "var(--text-muted)",
+      }}>
         HackaMined 2026 &middot; Cactus Communications
       </div>
     </div>
