@@ -104,7 +104,6 @@ DEFAULT_RULES: dict[str, Any] = {
         "page_format": "p. {page}",
     },
     "references": {
-        "style": "apa",
         "section_label": "References",
         "label_bold": True,
         "label_centered": True,
@@ -155,7 +154,6 @@ DEFAULT_RULES: dict[str, Any] = {
         "use_ampersand_in_citations": False,
         "use_ampersand_in_references": False,
         "oxford_comma": True,
-        "margin_units": "in",
     },
 }
 
@@ -277,6 +275,36 @@ def _sanitise_llm_rules(rules: dict) -> dict:
             _set_nested(sanitised, field_path, default_val)
 
     return sanitised
+
+
+# ---------------------------------------------------------------------------
+# _translate_ui_overrides — convert frontend UI fields to schema-compliant keys
+# ---------------------------------------------------------------------------
+
+def _translate_ui_overrides(overrides: dict) -> dict:
+    """
+    The frontend SemiCustomPanel sends conceptual override keys that don't
+    exist in the JSON schema (e.g. references.style, headings.numbering_style).
+    This function translates them into real schema-compliant fields and strips
+    any remaining non-schema keys from sections with additionalProperties=false.
+    """
+    result = copy.deepcopy(overrides)
+
+    # ── headings.numbering_style → H1/H2/H3 .numbering ──────────────────
+    if "headings" in result and "numbering_style" in result["headings"]:
+        ns = result["headings"].pop("numbering_style")
+        for level in ("H1", "H2", "H3"):
+            result["headings"].setdefault(level, {})["numbering"] = ns
+        logger.info("[RULE] Translated headings.numbering_style=%s → H1/H2/H3", ns)
+
+    # ── references.style → strip (UI-only concept, not a schema field) ───
+    if "references" in result and "style" in result["references"]:
+        removed = result["references"].pop("style")
+        logger.info("[RULE] Stripped non-schema field references.style=%s", removed)
+        if not result["references"]:
+            del result["references"]
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +643,7 @@ def generate_rules(
         logger.info("[RULE] Journal loaded: %s", journal)
 
         if overrides:
-            overrides_dict = copy.deepcopy(overrides)
+            overrides_dict = _translate_ui_overrides(overrides)
             merged = merge_rules(base, overrides_dict)
             logger.info("[RULE] Applied %d top-level overrides", len(overrides_dict))
         else:

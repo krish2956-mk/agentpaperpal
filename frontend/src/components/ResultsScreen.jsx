@@ -204,25 +204,23 @@ export default function ResultsScreen({ result, trustScore, onDownload, download
             <div className="rs-panel-header">
               <IconFile /> Formatted Preview
             </div>
-            <div className="rs-preview-frame">
-              {(result.document_structure || result.preview_url) ? (
-                result.document_structure ? (
-                  <LiveDocumentEditor
-                    documentStructure={result.document_structure}
-                    violations={result.interpretation_results?.violations || []}
-                  />
-                ) : (
-                  <iframe
-                    src={`${API}${result.preview_url}`}
-                    className="rs-preview-iframe"
-                    title="Formatted Paper Preview"
-                    sandbox="allow-same-origin"
-                  />
-                )
+            <div className="rs-preview-frame" id="viewer-panel">
+              {result.preview_url ? (
+                <iframe
+                  src={`${API}${result.preview_url}`}
+                  className="rs-preview-iframe"
+                  title="Formatted Paper Preview"
+                  sandbox="allow-same-origin allow-scripts"
+                />
+              ) : result.document_structure ? (
+                <LiveDocumentEditor
+                  documentStructure={result.document_structure}
+                  violations={result.interpretation_results?.violations || []}
+                />
               ) : (
                 <div className="rs-preview-placeholder">
                   <div className="rs-preview-icon"><IconFile /></div>
-                  <p>Live preview will appear here when <code>preview_url</code> or document structure is returned.</p>
+                  <p>No preview available.</p>
                   <p className="rs-preview-hint">Download the DOCX to view your formatted paper.</p>
                 </div>
               )}
