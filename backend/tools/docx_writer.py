@@ -1,18 +1,14 @@
 """
 DOCX Writer — Consumes docx_instructions from TRANSFORM agent.
 
-Three dedicated builders + in-place mode:
-  1. build_apa_docx(): APA-specific writer — page-based sections
-     (title_page, abstract_page, body, references_page).
-
-  2. build_ieee_docx(): IEEE-specific writer — flat sections with
-     2-column layout, 10pt font, single spacing, numbered references.
-
-  3. write_formatted_docx(): Generic fallback for Vancouver, Springer,
-     Chicago, etc. — rules-driven flat sections.
-
-  4. transform_docx_in_place(): In-place transformation of uploaded DOCX files.
-     Preserves figures, tables, and embedded objects.
+Six dedicated builders + in-place mode:
+  1. build_apa_docx():       APA-specific — page-based sections
+  2. build_ieee_docx():      IEEE-specific — 2-column, 10pt, single spacing
+  3. build_springer_docx():  Springer Nature — 10pt, single spacing, justified, numeric headings
+  4. build_chicago_docx():   Chicago 17th Ed — 12pt, double spacing, left-aligned, un-numbered headings
+  5. build_vancouver_docx(): Vancouver/ICMJE — 12pt, double spacing, UPPERCASE H1, numbered citations
+  6. write_formatted_docx(): Generic fallback — rules-driven flat sections
+  7. transform_docx_in_place(): In-place transformation of uploaded DOCX files.
 
 Routing is handled by crew.py via style_key from detect_style().
 """
@@ -897,29 +893,653 @@ def _to_roman(number) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GENERIC WRITER (fallback for Vancouver, Springer, Chicago, etc.)
+# SPRINGER NATURE WRITER (sn-mathphys-ay, author-date)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def write_formatted_docx(instructions: dict, output_path: str, image_store: Optional[dict] = None, table_store: Optional[dict] = None) -> str:
+def build_springer_docx(instructions: dict, output_path: str, image_store: Optional[dict] = None, table_store: Optional[dict] = None) -> str:
     """
-    Generic DOCX writer for journals without a dedicated builder.
+    Springer Nature DOCX builder.
 
-    Handles flat section lists (title, heading, paragraph, reference, etc.)
-    driven by rules from rules/*.json. Used as fallback for Vancouver,
-    Springer, Chicago, and other formats not yet having dedicated builders.
+    Handles flat section lists with Springer rules:
+    - 10pt Times New Roman, single spacing, justified
+    - Margins: 1" top/bottom, 1.25" left/right
+    - Numeric heading hierarchy (1, 1.1, 1.1.1)
+    - Author-date citations: (Smith 2020)
+    - Alphabetical references with hanging indent
+    - Fig. N (bold) captions below, Table N (bold) captions above
+    """
+    if not instructions or not instructions.get("sections"):
+        raise DocumentWriteError("docx_instructions must contain a non-empty 'sections' list.")
+
+    sections = instructions.get("sections", [])
+    rules = instructions.get("rules", {}) or {}
+
+    doc = Document()
+
+    # Springer: 10pt Times New Roman, single spacing, justified
+    font_name = "Times New Roman"
+    font_size = 10
+    line_spacing = 1.0
+
+    _apply_document_defaults(doc, font_name, font_size, line_spacing)
+
+    # Margins: 1" top/bottom, 1.25" left/right
+    for sec in doc.sections:
+        sec.top_margin = Inches(1.0)
+        sec.bottom_margin = Inches(1.0)
+        sec.left_margin = Inches(1.25)
+        sec.right_margin = Inches(1.25)
+
+    # Configure Springer heading styles
+    _configure_springer_heading_styles(doc, font_name)
+
+    for section in sections:
+        section_type = section.get("type", "paragraph")
+        content = section.get("content", "")
+        if content is None:
+            content = ""
+
+        try:
+            if section_type == "title":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, 14, bold=True)
+
+            elif section_type == "authors":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            elif section_type == "affiliations":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, 9, italic=True)
+
+            elif section_type == "abstract":
+                # Label
+                label_para = doc.add_paragraph()
+                label_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(label_para.paragraph_format, line_spacing)
+                label_run = label_para.add_run("Abstract")
+                _apply_font(label_run, font_name, font_size, bold=True)
+                # Body
+                body_para = doc.add_paragraph()
+                body_para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                _apply_line_spacing(body_para.paragraph_format, line_spacing)
+                _add_text_with_italics(body_para, content, font_name=font_name, font_size_pt=font_size)
+
+            elif section_type == "keywords":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run("Keywords ")
+                _apply_font(label_run, font_name, font_size, bold=True)
+                text_run = para.add_run(content)
+                _apply_font(text_run, font_name, font_size)
+
+            elif section_type == "heading":
+                level = _safe_int(section.get("level", 1), 1)
+                bold = section.get("bold", level <= 2)
+                italic = section.get("italic", level >= 3)
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                para.paragraph_format.space_before = Pt(12)
+                para.paragraph_format.space_after = Pt(6)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size, bold=bold, italic=italic)
+
+            elif section_type == "reference":
+                para = doc.add_paragraph()
+                para.paragraph_format.left_indent = Inches(0.5)
+                para.paragraph_format.first_line_indent = Inches(-0.5)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
+            elif section_type in ("figure_caption", "figure_block"):
+                _render_figure_image(doc, section, image_store, font_name, font_size)
+                # Springer: "Fig. N" bold, caption below
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run(f"Fig. {number}. " if number else "Fig. ")
+                _apply_font(label_run, font_name, font_size, bold=True)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size)
+
+            elif section_type in ("table_caption", "table_block"):
+                # Springer: "Table N" bold, caption above
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run(f"Table {number} " if number else "Table ")
+                _apply_font(label_run, font_name, font_size, bold=True)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size)
+                _render_table_data(doc, section, table_store, font_name, font_size)
+
+            else:
+                # Body paragraph: justified, 10pt, single spacing
+                _add_paragraph(doc, content, font_name, font_size, line_spacing, "justify")
+
+        except Exception as e:
+            logger.warning("[DOCX_SPRINGER] Failed to render section type=%s: %s", section_type, e)
+            try:
+                _add_paragraph(doc, content, font_name, font_size, line_spacing, "justify")
+            except Exception:
+                pass
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    logger.info("[DOCX_SPRINGER] Written | file=%s | sections=%d", out.name, len(sections))
+    return str(out)
+
+
+def _configure_springer_heading_styles(doc, font_name="Times New Roman"):
+    """Set up Springer heading styles: H1/H2 bold, H3 italic, all numbered."""
+    h1 = doc.styles['Heading 1']
+    h1.font.name = font_name
+    h1.font.size = Pt(10)
+    h1.font.bold = True
+    h1.font.italic = False
+    h1.font.color.rgb = RGBColor(0, 0, 0)
+    h1.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h1.paragraph_format.space_before = Pt(12)
+    h1.paragraph_format.space_after = Pt(6)
+    h1.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+    h2 = doc.styles['Heading 2']
+    h2.font.name = font_name
+    h2.font.size = Pt(10)
+    h2.font.bold = True
+    h2.font.italic = False
+    h2.font.color.rgb = RGBColor(0, 0, 0)
+    h2.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h2.paragraph_format.space_before = Pt(10)
+    h2.paragraph_format.space_after = Pt(4)
+    h2.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+    h3 = doc.styles['Heading 3']
+    h3.font.name = font_name
+    h3.font.size = Pt(10)
+    h3.font.bold = False
+    h3.font.italic = True
+    h3.font.color.rgb = RGBColor(0, 0, 0)
+    h3.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h3.paragraph_format.space_before = Pt(8)
+    h3.paragraph_format.space_after = Pt(4)
+    h3.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHICAGO 17TH EDITION WRITER (Author-Date)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_chicago_docx(instructions: dict, output_path: str, image_store: Optional[dict] = None, table_store: Optional[dict] = None) -> str:
+    """
+    Chicago Manual of Style (17th Ed, Author-Date) DOCX builder.
+
+    Handles flat section lists with Chicago rules:
+    - 12pt Times New Roman, double spacing, left-aligned (ragged right)
+    - 1" margins all sides
+    - First-line indent 0.5" for body paragraphs
+    - Un-numbered headings: H1 centered/bold, H2 left/not bold, H3 left/italic
+    - Author-date citations: (Smith 2020)
+    - Alphabetical references with hanging indent 0.5"
+    - Figure N. caption below, Table N caption above
     """
     if not instructions or not instructions.get("sections"):
         raise DocumentWriteError("docx_instructions must contain a non-empty 'sections' list.")
 
     sections = instructions.get("sections", [])
 
-    # Rules-driven generic format
+    doc = Document()
+
+    # Chicago: 12pt Times New Roman, double spacing, left-aligned
+    font_name = "Times New Roman"
+    font_size = 12
+    line_spacing = 2.0
+
+    _apply_document_defaults(doc, font_name, font_size, line_spacing)
+
+    # 1" margins all sides
+    for sec in doc.sections:
+        sec.top_margin = Inches(1.0)
+        sec.bottom_margin = Inches(1.0)
+        sec.left_margin = Inches(1.0)
+        sec.right_margin = Inches(1.0)
+
+    # Configure Chicago heading styles
+    _configure_chicago_heading_styles(doc, font_name)
+
+    for section in sections:
+        section_type = section.get("type", "paragraph")
+        content = section.get("content", "")
+        if content is None:
+            content = ""
+
+        try:
+            if section_type == "title":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)  # Not bold per Chicago
+
+            elif section_type == "authors":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            elif section_type == "affiliations":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            elif section_type == "abstract":
+                # Chicago: "Abstract" centered, not bold
+                label_para = doc.add_paragraph()
+                label_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _apply_line_spacing(label_para.paragraph_format, line_spacing)
+                label_run = label_para.add_run("Abstract")
+                _apply_font(label_run, font_name, font_size)
+                # Body: left-aligned, first-line indent
+                body_para = doc.add_paragraph()
+                body_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                body_para.paragraph_format.first_line_indent = Inches(0.5)
+                _apply_line_spacing(body_para.paragraph_format, line_spacing)
+                _add_text_with_italics(body_para, content, font_name=font_name, font_size_pt=font_size)
+
+            elif section_type == "keywords":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run("Keywords: ")
+                _apply_font(label_run, font_name, font_size, italic=True)
+                text_run = para.add_run(content)
+                _apply_font(text_run, font_name, font_size)
+
+            elif section_type == "heading":
+                level = _safe_int(section.get("level", 1), 1)
+                para = doc.add_paragraph()
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                para.paragraph_format.space_before = Pt(12)
+                para.paragraph_format.space_after = Pt(0)
+                if level == 1:
+                    # H1: Centered, Bold, Title Case
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run = para.add_run(content)
+                    _apply_font(run, font_name, font_size, bold=True)
+                elif level == 2:
+                    # H2: Left-aligned, Title Case, Not bold
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    run = para.add_run(content)
+                    _apply_font(run, font_name, font_size)
+                else:
+                    # H3+: Left-aligned, Italic, Title Case
+                    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    run = para.add_run(content)
+                    _apply_font(run, font_name, font_size, italic=True)
+
+            elif section_type == "reference":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                para.paragraph_format.left_indent = Inches(0.5)
+                para.paragraph_format.first_line_indent = Inches(-0.5)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
+            elif section_type in ("figure_caption", "figure_block"):
+                _render_figure_image(doc, section, image_store, font_name, font_size)
+                # Chicago: "Figure N. Caption" below, left-aligned
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_text = f"Figure {number}. " if number else "Figure. "
+                label_run = para.add_run(label_text)
+                _apply_font(label_run, font_name, font_size)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size)
+
+            elif section_type in ("table_caption", "table_block"):
+                # Chicago: "Table N" + caption above, minimal borders
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_text = f"Table {number}" if number else "Table"
+                label_run = para.add_run(label_text)
+                _apply_font(label_run, font_name, font_size)
+                if caption:
+                    cap_para = doc.add_paragraph()
+                    cap_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    _apply_line_spacing(cap_para.paragraph_format, line_spacing)
+                    cap_run = cap_para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size)
+                _render_table_data(doc, section, table_store, font_name, font_size)
+
+            else:
+                # Body paragraph: left-aligned, first-line indent 0.5"
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                para.paragraph_format.first_line_indent = Inches(0.5)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
+        except Exception as e:
+            logger.warning("[DOCX_CHICAGO] Failed to render section type=%s: %s", section_type, e)
+            try:
+                _add_paragraph(doc, content, font_name, font_size, line_spacing, "left")
+            except Exception:
+                pass
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    logger.info("[DOCX_CHICAGO] Written | file=%s | sections=%d", out.name, len(sections))
+    return str(out)
+
+
+def _configure_chicago_heading_styles(doc, font_name="Times New Roman"):
+    """Set up Chicago heading styles: H1 centered/bold, H2 left, H3 left/italic."""
+    h1 = doc.styles['Heading 1']
+    h1.font.name = font_name
+    h1.font.size = Pt(12)
+    h1.font.bold = True
+    h1.font.italic = False
+    h1.font.color.rgb = RGBColor(0, 0, 0)
+    h1.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    h1.paragraph_format.space_before = Pt(12)
+    h1.paragraph_format.space_after = Pt(0)
+    h1.paragraph_format.line_spacing = 2.0
+
+    h2 = doc.styles['Heading 2']
+    h2.font.name = font_name
+    h2.font.size = Pt(12)
+    h2.font.bold = False
+    h2.font.italic = False
+    h2.font.color.rgb = RGBColor(0, 0, 0)
+    h2.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h2.paragraph_format.space_before = Pt(12)
+    h2.paragraph_format.space_after = Pt(0)
+    h2.paragraph_format.line_spacing = 2.0
+
+    h3 = doc.styles['Heading 3']
+    h3.font.name = font_name
+    h3.font.size = Pt(12)
+    h3.font.bold = False
+    h3.font.italic = True
+    h3.font.color.rgb = RGBColor(0, 0, 0)
+    h3.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h3.paragraph_format.space_before = Pt(12)
+    h3.paragraph_format.space_after = Pt(0)
+    h3.paragraph_format.line_spacing = 2.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VANCOUVER (ICMJE / BIOMEDICAL) WRITER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_vancouver_docx(instructions: dict, output_path: str, image_store: Optional[dict] = None, table_store: Optional[dict] = None) -> str:
+    """
+    Vancouver (ICMJE) DOCX builder for biomedical manuscripts.
+
+    Handles flat section lists with Vancouver rules:
+    - 12pt Times New Roman, double spacing, left-aligned
+    - 1" margins all sides
+    - First-line indent 0.5" for body paragraphs
+    - Structured headings: H1 UPPERCASE/bold, H2 Title Case/bold, H3 italic
+    - Numbered citations [1], ordered by first appearance
+    - References numbered by appearance, hanging indent
+    - Figure N. caption below, Table N. caption above
+    """
+    if not instructions or not instructions.get("sections"):
+        raise DocumentWriteError("docx_instructions must contain a non-empty 'sections' list.")
+
+    sections = instructions.get("sections", [])
+
+    doc = Document()
+
+    # Vancouver: 12pt Times New Roman, double spacing, left-aligned
+    font_name = "Times New Roman"
+    font_size = 12
+    line_spacing = 2.0
+
+    _apply_document_defaults(doc, font_name, font_size, line_spacing)
+
+    # 1" margins all sides
+    for sec in doc.sections:
+        sec.top_margin = Inches(1.0)
+        sec.bottom_margin = Inches(1.0)
+        sec.left_margin = Inches(1.0)
+        sec.right_margin = Inches(1.0)
+
+    # Configure Vancouver heading styles
+    _configure_vancouver_heading_styles(doc, font_name)
+
+    for section in sections:
+        section_type = section.get("type", "paragraph")
+        content = section.get("content", "")
+        if content is None:
+            content = ""
+
+        try:
+            if section_type == "title":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)  # Not bold per Vancouver
+
+            elif section_type == "authors":
+                # Vancouver: Surname Initials (no periods)
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            elif section_type == "affiliations":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            elif section_type == "abstract":
+                # Vancouver: "Abstract" bold, left-aligned
+                label_para = doc.add_paragraph()
+                label_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(label_para.paragraph_format, line_spacing)
+                label_run = label_para.add_run("Abstract")
+                _apply_font(label_run, font_name, font_size, bold=True)
+                # Body: left-aligned, no indent for abstract
+                body_para = doc.add_paragraph()
+                body_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(body_para.paragraph_format, line_spacing)
+                _add_text_with_italics(body_para, content, font_name=font_name, font_size_pt=font_size)
+
+            elif section_type == "keywords":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run("Keywords: ")
+                _apply_font(label_run, font_name, font_size, bold=True)
+                text_run = para.add_run(content)
+                _apply_font(text_run, font_name, font_size)
+
+            elif section_type == "heading":
+                level = _safe_int(section.get("level", 1), 1)
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                para.paragraph_format.space_before = Pt(12)
+                para.paragraph_format.space_after = Pt(0)
+                if level == 1:
+                    # H1: Bold, UPPERCASE
+                    run = para.add_run(content.upper())
+                    _apply_font(run, font_name, font_size, bold=True)
+                elif level == 2:
+                    # H2: Bold, Title Case
+                    run = para.add_run(content)
+                    _apply_font(run, font_name, font_size, bold=True)
+                else:
+                    # H3+: Italic, Title Case
+                    run = para.add_run(content)
+                    _apply_font(run, font_name, font_size, italic=True)
+
+            elif section_type == "reference":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                para.paragraph_format.left_indent = Inches(0.5)
+                para.paragraph_format.first_line_indent = Inches(-0.5)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
+            elif section_type in ("figure_caption", "figure_block"):
+                _render_figure_image(doc, section, image_store, font_name, font_size)
+                # Vancouver: "Figure N. Caption" below figure
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_text = f"Figure {number}. " if number else "Figure. "
+                label_run = para.add_run(label_text)
+                _apply_font(label_run, font_name, font_size, bold=True)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size)
+
+            elif section_type in ("table_caption", "table_block"):
+                # Vancouver: "Table N. Caption" above table
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_text = f"Table {number}. " if number else "Table. "
+                label_run = para.add_run(label_text)
+                _apply_font(label_run, font_name, font_size, bold=True)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size)
+                _render_table_data(doc, section, table_store, font_name, font_size)
+
+            else:
+                # Body paragraph: left-aligned, first-line indent 0.5"
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                para.paragraph_format.first_line_indent = Inches(0.5)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
+        except Exception as e:
+            logger.warning("[DOCX_VANCOUVER] Failed to render section type=%s: %s", section_type, e)
+            try:
+                _add_paragraph(doc, content, font_name, font_size, line_spacing, "left")
+            except Exception:
+                pass
+
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    logger.info("[DOCX_VANCOUVER] Written | file=%s | sections=%d", out.name, len(sections))
+    return str(out)
+
+
+def _configure_vancouver_heading_styles(doc, font_name="Times New Roman"):
+    """Set up Vancouver heading styles: H1 bold/uppercase, H2 bold, H3 italic."""
+    h1 = doc.styles['Heading 1']
+    h1.font.name = font_name
+    h1.font.size = Pt(12)
+    h1.font.bold = True
+    h1.font.italic = False
+    h1.font.color.rgb = RGBColor(0, 0, 0)
+    h1.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h1.paragraph_format.space_before = Pt(12)
+    h1.paragraph_format.space_after = Pt(0)
+    h1.paragraph_format.line_spacing = 2.0
+
+    h2 = doc.styles['Heading 2']
+    h2.font.name = font_name
+    h2.font.size = Pt(12)
+    h2.font.bold = True
+    h2.font.italic = False
+    h2.font.color.rgb = RGBColor(0, 0, 0)
+    h2.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h2.paragraph_format.space_before = Pt(12)
+    h2.paragraph_format.space_after = Pt(0)
+    h2.paragraph_format.line_spacing = 2.0
+
+    h3 = doc.styles['Heading 3']
+    h3.font.name = font_name
+    h3.font.size = Pt(12)
+    h3.font.bold = False
+    h3.font.italic = True
+    h3.font.color.rgb = RGBColor(0, 0, 0)
+    h3.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    h3.paragraph_format.space_before = Pt(12)
+    h3.paragraph_format.space_after = Pt(0)
+    h3.paragraph_format.line_spacing = 2.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GENERIC WRITER (fallback for other formats)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def write_formatted_docx(instructions: dict, output_path: str, image_store: Optional[dict] = None, table_store: Optional[dict] = None) -> str:
+    """
+    Fully rules-driven generic DOCX writer for custom / unknown journals.
+
+    Every formatting decision is read from the rules JSON (passed via
+    instructions["rules"]) so that when a user provides a custom PDF and
+    custom rules are generated, those rules drive the output exactly.
+
+    Rules keys consumed:
+      document      → font, font_size, line_spacing, margins, columns, alignment
+      title_page    → title_bold, title_centered, title_font_size, title_case
+      abstract      → label, label_bold, label_centered, label_italic,
+                       indent_first_line, keywords_label, keywords_italic
+      headings.H1/2/3 → bold, italic, centered, case, font_size, underline
+      references    → hanging_indent, indent_size, line_spacing, label_bold,
+                       label_centered, space_between_entries
+      figures       → label_prefix, label_bold, caption_italic, caption_alignment
+      tables        → label_prefix, label_bold, caption_italic, caption_alignment
+    """
+    if not instructions or not instructions.get("sections"):
+        raise DocumentWriteError("docx_instructions must contain a non-empty 'sections' list.")
+
+    sections = instructions.get("sections", [])
+
+    # ── All formatting comes from rules ──
     rules = instructions.get("rules", {}) or {}
 
-    # Improvement 11: Template-aware document generation
+    # Template-aware document generation
     style_name = (rules.get("style_name") or "Standard").strip()
     template_path = Path(__file__).parent.parent / "templates" / f"{style_name}.docx"
-    
+
     if template_path.exists():
         logger.info("[DOCX] Using journal template: %s", template_path.name)
         doc = Document(str(template_path))
@@ -927,6 +1547,7 @@ def write_formatted_docx(instructions: dict, output_path: str, image_store: Opti
         logger.debug("[DOCX] No template found for '%s' — using blank document", style_name)
         doc = Document()
 
+    # ── Document-level rules ──
     doc_rules = rules.get("document", {})
     font_name = doc_rules.get("font", "Times New Roman")
     font_size = _safe_int(doc_rules.get("font_size", 12), 12)
@@ -939,6 +1560,31 @@ def write_formatted_docx(instructions: dict, output_path: str, image_store: Opti
     _set_document_margins(doc, margins)
     _set_columns(doc, columns)
 
+    # ── Pre-fetch sub-rule dicts once ──
+    title_rules = rules.get("title_page", {})
+    abstract_rules = rules.get("abstract", {})
+    heading_rules_map = rules.get("headings", {})
+    ref_rules = rules.get("references", {})
+    fig_rules = rules.get("figures", {})
+    tbl_rules = rules.get("tables", {})
+
+    # Reference-specific line spacing (may differ from body)
+    ref_line_spacing = _safe_float(ref_rules.get("line_spacing", line_spacing), line_spacing)
+    ref_space_between = ref_rules.get("space_between_entries", False)
+
+    # Alignment helper
+    def _resolve_alignment(align_str: str):
+        a = align_str.lower()
+        if a == "center":
+            return WD_ALIGN_PARAGRAPH.CENTER
+        if a == "right":
+            return WD_ALIGN_PARAGRAPH.RIGHT
+        if a == "justify":
+            return WD_ALIGN_PARAGRAPH.JUSTIFY
+        return WD_ALIGN_PARAGRAPH.LEFT
+
+    body_align = _resolve_alignment(doc_alignment)
+
     for section in sections:
         section_type = section.get("type", "paragraph")
         content = section.get("content", "")
@@ -946,34 +1592,156 @@ def write_formatted_docx(instructions: dict, output_path: str, image_store: Opti
             content = ""
 
         try:
+            # ── Title ──
             if section_type == "title":
-                title_rules = rules.get("title_page", {})
-                _add_title(doc, content, title_rules, font_name, font_size)
+                para = doc.add_paragraph()
+                centered = title_rules.get("title_centered", True)
+                bold = title_rules.get("title_bold", False)
+                title_size = _safe_int(title_rules.get("title_font_size", font_size), font_size)
+                title_case = title_rules.get("title_case", "")
+                display = _apply_case_transform(content, title_case) if title_case else content
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER if centered else WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(display)
+                _apply_font(run, font_name, title_size, bold=bold)
+
+            # ── Authors ──
+            elif section_type == "authors":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER if title_rules.get("title_centered", True) else WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            # ── Affiliations ──
+            elif section_type == "affiliations":
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER if title_rules.get("title_centered", True) else WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                run = para.add_run(content)
+                _apply_font(run, font_name, font_size)
+
+            # ── Abstract ──
+            elif section_type == "abstract":
+                label = abstract_rules.get("label", "Abstract")
+                label_bold = abstract_rules.get("label_bold", False)
+                label_italic = abstract_rules.get("label_italic", False)
+                label_centered = abstract_rules.get("label_centered", True)
+                indent_first = abstract_rules.get("indent_first_line", False)
+
+                label_para = doc.add_paragraph()
+                label_para.alignment = WD_ALIGN_PARAGRAPH.CENTER if label_centered else WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(label_para.paragraph_format, line_spacing)
+                label_run = label_para.add_run(label)
+                _apply_font(label_run, font_name, font_size, bold=label_bold, italic=label_italic)
+
+                body_para = doc.add_paragraph()
+                body_para.alignment = body_align
+                if indent_first:
+                    body_para.paragraph_format.first_line_indent = Inches(0.5)
+                _apply_line_spacing(body_para.paragraph_format, line_spacing)
+                _add_text_with_italics(body_para, content, font_name=font_name, font_size_pt=font_size)
+
+            # ── Keywords ──
+            elif section_type == "keywords":
+                kw_label = abstract_rules.get("keywords_label", "Keywords:")
+                kw_italic = abstract_rules.get("keywords_italic", False)
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run(kw_label + " ")
+                _apply_font(label_run, font_name, font_size, italic=kw_italic)
+                text_run = para.add_run(content)
+                _apply_font(text_run, font_name, font_size)
+
+            # ── Headings (fully rules-driven per level) ──
             elif section_type == "heading":
                 level = _safe_int(section.get("level", 1), 1)
-                heading_rules = rules.get("headings", {}).get(f"H{level}", {})
-                _add_heading(doc, content, level, heading_rules, font_name, font_size)
-            elif section_type == "abstract":
-                abstract_rules = rules.get("abstract", {})
-                _add_abstract(doc, content, abstract_rules, font_name, font_size, line_spacing)
-            elif section_type == "keywords":
-                kw_rules = rules.get("keywords_section", rules.get("abstract", {}))
-                _add_keywords(doc, content, kw_rules, font_name, font_size)
+                h_rules = heading_rules_map.get(f"H{level}", {})
+                bold = h_rules.get("bold", True)
+                italic = h_rules.get("italic", False)
+                centered = h_rules.get("centered", False)
+                underline = h_rules.get("underline", False)
+                case = h_rules.get("case", "Title Case")
+                h_font_size = _safe_int(h_rules.get("font_size", font_size), font_size)
+                display = _apply_case_transform(content, case) if case else content
+                # Apply UPPERCASE from case rule
+                if case == "UPPERCASE":
+                    display = display.upper()
+
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER if centered else WD_ALIGN_PARAGRAPH.LEFT
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                para.paragraph_format.space_before = Pt(12)
+                para.paragraph_format.space_after = Pt(6)
+                run = para.add_run(display)
+                _apply_font(run, font_name, h_font_size, bold=bold, italic=italic)
+                if underline:
+                    run.underline = True
+
+            # ── References (rules-driven spacing + indent) ──
             elif section_type == "reference":
-                ref_rules = rules.get("references", {})
-                _add_reference(doc, content, ref_rules, font_name, font_size)
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                hanging = ref_rules.get("hanging_indent", True)
+                indent_size = _parse_measurement(ref_rules.get("indent_size", 0.5))
+                if hanging:
+                    para.paragraph_format.left_indent = Inches(indent_size)
+                    para.paragraph_format.first_line_indent = Inches(-indent_size)
+                _apply_line_spacing(para.paragraph_format, ref_line_spacing)
+                if ref_space_between:
+                    para.paragraph_format.space_after = Pt(6)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
+            # ── Figures (rules-driven label + position) ──
             elif section_type in ("figure_caption", "figure_block"):
-                fig_rules = rules.get("figures", {})
+                label_prefix = fig_rules.get("label_prefix", "Figure")
+                label_bold = fig_rules.get("label_bold", True)
+                caption_italic = fig_rules.get("caption_italic", False)
+                cap_align = fig_rules.get("caption_alignment", "center")
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                label_text = f"{label_prefix} {number}. " if number else f"{label_prefix} "
+
                 _render_figure_image(doc, section, image_store, font_name, font_size)
-                _add_figure_caption(doc, content, fig_rules, font_name, font_size)
+                para = doc.add_paragraph()
+                para.alignment = _resolve_alignment(cap_align)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run(label_text)
+                _apply_font(label_run, font_name, font_size, bold=label_bold)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size, italic=caption_italic)
+
+            # ── Tables (rules-driven label + position) ──
             elif section_type in ("table_caption", "table_block"):
-                tbl_rules = rules.get("tables", {})
-                _add_table_caption(doc, content, tbl_rules, font_name, font_size)
+                label_prefix = tbl_rules.get("label_prefix", "Table")
+                label_bold = tbl_rules.get("label_bold", True)
+                caption_italic = tbl_rules.get("caption_italic", False)
+                cap_align = tbl_rules.get("caption_alignment", "center")
+                number = section.get("number", "")
+                caption = section.get("caption", section.get("content", ""))
+                label_text = f"{label_prefix} {number}. " if number else f"{label_prefix} "
+
+                para = doc.add_paragraph()
+                para.alignment = _resolve_alignment(cap_align)
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                label_run = para.add_run(label_text)
+                _apply_font(label_run, font_name, font_size, bold=label_bold)
+                if caption:
+                    cap_run = para.add_run(caption)
+                    _apply_font(cap_run, font_name, font_size, italic=caption_italic)
                 _render_table_data(doc, section, table_store, font_name, font_size)
+
+            # ── Body paragraphs ──
             else:
-                _add_paragraph(doc, content, font_name, font_size, line_spacing, doc_alignment)
+                para = doc.add_paragraph()
+                para.alignment = body_align
+                _apply_line_spacing(para.paragraph_format, line_spacing)
+                _add_text_with_italics(para, content, font_name=font_name, font_size_pt=font_size)
+
         except Exception as e:
-            logger.warning("[DOCX] Failed to render section type=%s: %s", section_type, e)
+            logger.warning("[DOCX_GENERIC] Failed to render section type=%s: %s", section_type, e)
             try:
                 _add_paragraph(doc, content, font_name, font_size, line_spacing, doc_alignment)
             except Exception:

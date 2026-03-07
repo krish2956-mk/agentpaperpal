@@ -22,7 +22,10 @@ from agents import (
 from agents.validate_agent import SECTION_WEIGHTS
 from tools.compliance_checker import apply_deterministic_checks, run_deterministic_checks
 from tools.docx_reader import extract_docx_text
-from tools.docx_writer import build_apa_docx, build_ieee_docx, transform_docx_in_place, write_formatted_docx
+from tools.docx_writer import (
+    build_apa_docx, build_chicago_docx, build_ieee_docx, build_springer_docx,
+    build_vancouver_docx, transform_docx_in_place, write_formatted_docx,
+)
 from tools.logger import get_logger
 from tools.media_extractor import extract_all_media, map_figures_to_images, map_tables_to_captions
 from tools.pre_format_scorer import score_pre_format
@@ -1697,9 +1700,12 @@ def _write_docx_from_transform(
     Extract transform output and write the formatted DOCX file.
 
     Routes to the appropriate builder based on style_key:
-      - "apa"     → build_apa_docx()    (page-based sections)
-      - "ieee"    → build_ieee_docx()   (flat sections, 2-column, 10pt)
-      - "generic" → write_formatted_docx() (rules-driven fallback)
+      - "apa"       → build_apa_docx()       (page-based sections)
+      - "ieee"      → build_ieee_docx()      (flat sections, 2-column, 10pt)
+      - "springer"  → build_springer_docx()  (10pt, single spacing, justified)
+      - "chicago"   → build_chicago_docx()   (12pt, double spacing, left-aligned)
+      - "vancouver" → build_vancouver_docx() (12pt, double spacing, numbered citations)
+      - "generic"   → write_formatted_docx() (rules-driven fallback)
 
     For DOCX source files with non-APA styles, may use transform_docx_in_place()
     to preserve figures, tables, and embedded objects.
@@ -1762,7 +1768,70 @@ def _write_docx_from_transform(
         build_ieee_docx(docx_instructions, output_path, image_store=image_store, table_store=table_store)
         return output_filename
 
-    # ── Path C: DOCX source with in-place transformation (preserves figures/tables) ──
+    # ── Path C: Springer → build_springer_docx (10pt, single spacing, justified) ──
+    if style_key == "springer":
+        if not isinstance(sections, list) or not sections:
+            raise TransformError(
+                "Springer docx_instructions missing 'sections' list. "
+                f"Keys: {list(docx_instructions.keys()) if isinstance(docx_instructions, dict) else '(not a dict)'}"
+            )
+        docx_instructions = _normalize_docx_instructions(docx_instructions)
+        _validate_docx_instructions(docx_instructions)
+        sections = _guard_section_contents(sections, paper_content)
+        if not sections:
+            raise TransformError(
+                "All sections were empty after content guard — transform agent produced no usable content."
+            )
+        docx_instructions["sections"] = _normalize_section_types(sections)
+        docx_instructions["rules"] = rules
+        logger.info("[DOCX] Springer format — using build_springer_docx — %d sections → %s",
+                    len(docx_instructions["sections"]), output_filename)
+        build_springer_docx(docx_instructions, output_path, image_store=image_store, table_store=table_store)
+        return output_filename
+
+    # ── Path D: Chicago → build_chicago_docx (12pt, double spacing, left-aligned) ──
+    if style_key == "chicago":
+        if not isinstance(sections, list) or not sections:
+            raise TransformError(
+                "Chicago docx_instructions missing 'sections' list. "
+                f"Keys: {list(docx_instructions.keys()) if isinstance(docx_instructions, dict) else '(not a dict)'}"
+            )
+        docx_instructions = _normalize_docx_instructions(docx_instructions)
+        _validate_docx_instructions(docx_instructions)
+        sections = _guard_section_contents(sections, paper_content)
+        if not sections:
+            raise TransformError(
+                "All sections were empty after content guard — transform agent produced no usable content."
+            )
+        docx_instructions["sections"] = _normalize_section_types(sections)
+        docx_instructions["rules"] = rules
+        logger.info("[DOCX] Chicago format — using build_chicago_docx — %d sections → %s",
+                    len(docx_instructions["sections"]), output_filename)
+        build_chicago_docx(docx_instructions, output_path, image_store=image_store, table_store=table_store)
+        return output_filename
+
+    # ── Path E: Vancouver → build_vancouver_docx (12pt, double spacing, numbered citations) ──
+    if style_key == "vancouver":
+        if not isinstance(sections, list) or not sections:
+            raise TransformError(
+                "Vancouver docx_instructions missing 'sections' list. "
+                f"Keys: {list(docx_instructions.keys()) if isinstance(docx_instructions, dict) else '(not a dict)'}"
+            )
+        docx_instructions = _normalize_docx_instructions(docx_instructions)
+        _validate_docx_instructions(docx_instructions)
+        sections = _guard_section_contents(sections, paper_content)
+        if not sections:
+            raise TransformError(
+                "All sections were empty after content guard — transform agent produced no usable content."
+            )
+        docx_instructions["sections"] = _normalize_section_types(sections)
+        docx_instructions["rules"] = rules
+        logger.info("[DOCX] Vancouver format — using build_vancouver_docx — %d sections → %s",
+                    len(docx_instructions["sections"]), output_filename)
+        build_vancouver_docx(docx_instructions, output_path, image_store=image_store, table_store=table_store)
+        return output_filename
+
+    # ── Path F: DOCX source with in-place transformation (preserves figures/tables) ──
     # Only used for generic styles where preserving original DOCX structure matters.
     if source_docx_path and Path(source_docx_path).exists():
         logger.info("[DOCX] In-place transformation (style=%s) — source=%s → %s",
@@ -1770,7 +1839,7 @@ def _write_docx_from_transform(
         transform_docx_in_place(source_docx_path, transform_data, rules, output_path)
         return output_filename
 
-    # ── Path D: Generic PDF/TXT source — rebuild from extracted text ──
+    # ── Path G: Generic PDF/TXT source — rebuild from extracted text ──
     if not isinstance(sections, list) or len(sections) == 0:
         raise TransformError(
             "docx_instructions is missing a non-empty 'sections' list. "

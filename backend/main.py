@@ -1373,30 +1373,140 @@ async def preview_file(filepath: str) -> HTMLResponse:
 
 
 # ---------------------------------------------------------------------------
+# Custom rules normalizer — deep-merge LLM output with guaranteed defaults
+# ---------------------------------------------------------------------------
+
+def _normalize_custom_rules(rules: dict, request_id: str = "") -> dict:
+    """
+    Deep-merge LLM-generated rules with DEFAULT_RULES from rule_engine.
+
+    Reuses the same canonical defaults that the pipeline uses, so
+    every sub-key the DOCX writer reads is guaranteed to exist.
+    LLM values always take priority over defaults.
+    """
+    from engine.rule_engine import DEFAULT_RULES, apply_defaults, _sanitise_llm_rules
+
+    sanitised = _sanitise_llm_rules(rules)
+    normalized = apply_defaults(sanitised)
+
+    # Ensure title_page and equations exist
+    if "title_page" not in normalized:
+        normalized["title_page"] = dict(DEFAULT_RULES["title_page"])
+    if "equations" not in normalized:
+        normalized["equations"] = dict(DEFAULT_RULES["equations"])
+
+    filled = [k for k in DEFAULT_RULES if k not in rules and isinstance(DEFAULT_RULES.get(k), dict)]
+    if filled:
+        logger.warning("[EXTRACT-RULES:%s] Filled missing top-level keys with defaults: %s", request_id, filled)
+
+    return normalized
+
+
+# ---------------------------------------------------------------------------
 # POST /extract-rules — Full Custom: Extract rules from guideline PDF via LLM
 # ---------------------------------------------------------------------------
 _RULES_EXTRACTION_PROMPT = """You are an expert academic formatting analyst. Given the text of a journal's author guidelines document, extract the formatting rules into a structured JSON object.
 
-You MUST return ONLY a valid JSON object with EXACTLY these 11 top-level keys:
-- style_name (string): Name of the formatting style
-- document (object): font, font_size, line_spacing, margins (top/bottom/left/right), alignment, columns
-- title_page (object): title_case, title_bold, title_centered, title_font_size
-- abstract (object): label, label_bold, label_centered, label_italic, max_words, indent_first_line, keywords_present
-- headings (object): H1/H2/H3 each with bold, italic, centered, underline, case, numbering, font_size
-- citations (object): style (author-date or numbered), brackets, format examples
-- references (object): section_label, ordering, hanging_indent, formats for journal_article/book/website
-- figures (object): label_prefix, caption_position (above/below), numbering
-- tables (object): label_prefix, caption_position, numbering, border_style
-- equations (object): numbering, numbering_format
-- general_rules (object): doi_format, date_format, et_al_threshold, oxford_comma
+You MUST return ONLY a valid JSON object with EXACTLY these top-level keys and sub-keys:
+
+1. style_name (string): Name of the formatting style
+
+2. document (object):
+   - font (string, e.g. "Times New Roman")
+   - font_size (integer, e.g. 12)
+   - line_spacing (float, e.g. 2.0)
+   - margins (object): top, bottom, left, right — each a string like "1in"
+   - alignment (string): "left" | "justify" | "center" | "right"
+   - columns (integer, 1 or 2)
+
+3. title_page (object):
+   - title_case (string): "Title Case" | "UPPERCASE" | "Sentence case"
+   - title_bold (boolean)
+   - title_centered (boolean)
+   - title_font_size (integer)
+
+4. abstract (object):
+   - label (string, e.g. "Abstract")
+   - label_bold (boolean)
+   - label_centered (boolean)
+   - label_italic (boolean)
+   - max_words (integer, e.g. 250)
+   - indent_first_line (boolean)
+   - keywords_present (boolean)
+   - keywords_label (string, e.g. "Keywords:")
+   - keywords_italic (boolean)
+
+5. headings (object): H1, H2, H3 — each with:
+   - bold (boolean)
+   - italic (boolean)
+   - centered (boolean)
+   - underline (boolean)
+   - case (string): "Title Case" | "UPPERCASE" | "Sentence case"
+   - numbering (string): "none" | "numeric" | "roman" | "alpha"
+   - font_size (integer)
+
+6. citations (object):
+   - style (string): "author-date" | "numbered"
+   - brackets (string): "parentheses" | "square" | "none"
+   - format_one_author (string, e.g. "(Author Year)")
+   - format_two_authors (string, e.g. "(Author & Author Year)")
+   - format_three_plus (string, e.g. "(Author et al. Year)")
+   - format_numbered (string or null, e.g. "[N]")
+   - include_page_for_quotes (boolean)
+   - page_format (string, e.g. "p. 45")
+
+7. references (object):
+   - section_label (string, e.g. "References")
+   - label_bold (boolean)
+   - label_centered (boolean)
+   - label_italic (boolean)
+   - ordering (string): "alphabetical" | "appearance"
+   - hanging_indent (boolean)
+   - indent_size (string, e.g. "0.5in")
+   - line_spacing (float, e.g. 2.0)
+   - space_between_entries (boolean)
+   - formats (object): journal_article, book, book_chapter, website, conference_paper — each a string template
+
+8. figures (object):
+   - label_prefix (string, e.g. "Figure" or "Fig.")
+   - label_bold (boolean)
+   - label_italic (boolean)
+   - caption_position (string): "above" | "below"
+   - caption_italic (boolean)
+   - caption_alignment (string): "left" | "center" | "right"
+   - numbering (string): "arabic" | "roman"
+   - note_label (string, e.g. "Note:")
+
+9. tables (object):
+   - label_prefix (string, e.g. "Table")
+   - label_bold (boolean)
+   - label_italic (boolean)
+   - caption_position (string): "above" | "below"
+   - caption_italic (boolean)
+   - caption_alignment (string): "left" | "center" | "right"
+   - numbering (string): "arabic" | "roman"
+   - border_style (string): "full" | "full_grid" | "top_bottom_only" | "header_only" | "none"
+   - note_label (string, e.g. "Note:")
+
+10. equations (object):
+    - numbering (string, e.g. "right_aligned")
+    - numbering_format (string, e.g. "(1)")
+
+11. general_rules (object):
+    - doi_format (string)
+    - url_format (string)
+    - date_format (string)
+    - et_al_threshold (integer)
+    - use_ampersand_in_citations (boolean)
+    - use_ampersand_in_references (boolean)
+    - oxford_comma (boolean)
 
 IMPORTANT RULES:
+- You MUST include ALL sub-keys listed above in your output
 - If a specific rule is not mentioned in the guidelines, use sensible academic defaults
 - font_size must be an integer (e.g., 12)
 - line_spacing must be a float (e.g., 2.0)
 - margins should be strings like "1in"
-- For headings, numbering should be one of: "none", "roman", "numeric", "alpha"
-- For citations style, use "author-date" or "numbered"
 - Return ONLY the JSON object, no markdown fences, no explanation
 
 Here is the guideline document text:
@@ -1478,25 +1588,9 @@ async def extract_rules_from_guidelines(
 
         rules = json.loads(json_text)
 
-        # Validate required keys
-        required_keys = [
-            "style_name", "document", "abstract", "headings",
-            "citations", "references", "figures", "tables",
-            "general_rules",
-        ]
-        missing = [k for k in required_keys if k not in rules]
-        if missing:
-            logger.warning("[EXTRACT-RULES:%s] LLM output missing keys: %s", request_id, missing)
-            # Fill in missing keys with defaults
-            defaults = json.loads((RULES_DIR / "apa7.json").read_text())
-            for k in missing:
-                rules[k] = defaults.get(k, {})
-
-        # Ensure title_page and equations exist
-        if "title_page" not in rules:
-            rules["title_page"] = {"title_case": "Title Case", "title_bold": True, "title_centered": True, "title_font_size": 12}
-        if "equations" not in rules:
-            rules["equations"] = {"numbering": "right_aligned", "numbering_format": "(1)"}
+        # Deep-merge with defaults so every sub-key the DOCX writer
+        # reads is guaranteed to exist, even if the LLM skipped it.
+        rules = _normalize_custom_rules(rules, request_id)
 
         logger.info("[EXTRACT-RULES:%s] Rules extracted — style=%s keys=%d",
                     request_id, rules.get("style_name", "Custom"), len(rules))

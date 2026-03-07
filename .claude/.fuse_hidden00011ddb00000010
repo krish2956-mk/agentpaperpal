@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install tailwindcss autoprefixer)",
+      "Bash(npm install @tailwindcss/postcss)",
+      "Bash(source venv/bin/activate)",
+      "Bash(python -c \"from tools.pre_format_scorer import score_pre_format; print\\(''Import OK''\\)\")",
+      "Bash(python -c \"from main import app; print\\(''Backend imports OK''\\)\")",
+      "Bash(python -c \"from main import app; from crew import run_pipeline; print\\(''All imports OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python3 -c \":*)",
+      "Bash(git pull)",
+      "Bash(git stash)",
+      "Bash(git stash pop)",
+      "Bash(npm install diff-match-patch docx file-saver html2canvas jspdf)",
+      "Bash(git stash push -m \"uncommitted changes before reset to 4e74e04\")",
+      "Bash(git reset --hard 4e74e04)",
+      "Bash(git push --force origin develop)"
+    ]
+  }
+}
