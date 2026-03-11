@@ -905,7 +905,7 @@ export default function App() {
                           <div style={{ fontWeight: 700, marginBottom: 4 }}>
                             {m === 'standard' ? 'Standard' : 'Semi Custom'}
                           </div>
-                          <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                          <div style={{ fontSize: '0.75rem', color: selectedMode === m ? '#fff' : 'var(--text-secondary)' }}>
                             {m === 'standard'
                               ? `Use defaults for ${journal}`
                               : `Configure specific ${journal} rules`

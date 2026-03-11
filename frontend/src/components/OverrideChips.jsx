@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 
-const API = 'http://localhost:8000'
+const API = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
 const IconCheck = () => (
   <svg width="12" height="12" fill="none" viewBox="0 0 24 24">

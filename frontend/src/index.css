@@ -1049,14 +1049,105 @@ input, select { font-family: var(--font); }
    RESPONSIVE
 ============================================================ */
 @media (max-width:640px) {
-  .hero { padding:70px 0 60px; }
-  .tool-card { padding:24px 18px; }
-  .score-gauge-wrap { flex-direction:column; align-items:flex-start; }
-  .bar-label { width:100px; }
-  .steps-row::before { display:none; }
-  .hero-actions { flex-direction:column; align-items:center; }
-  .navbar-links { display:none; }
-  .auth-card { padding:32px 24px; }
+  /* Layout & Global */
+  .app { overflow-x: hidden; }
+  .container { padding: 0 16px; max-width: 100%; }
+  .section { padding: 40px 0; }
+  
+  /* Shutter — ensure full-width coverage on mobile */
+  .shutter-wrap { width: 100vw; left: 0; right: 0; }
+  .shutter-panel { min-width: 50vw; }
+  
+  /* Hero Curtain — full viewport width */
+  .hero-curtain { width: 100vw; left: 0; right: 0; }
+  .hero-curtain-inner span { font-size: 1.3rem; }
+  
+  /* Hero Section — full spread */
+  .hero { padding: 40px 0 30px; width: 100%; overflow: hidden; }
+  .hero-bg { width: 100vw; left: 0; }
+  .hero-blob { width: 300px; height: 300px; }
+  .hero-inner { padding: 0 16px; }
+  .hero-title { font-size: 2rem; letter-spacing: -1px; }
+  .hero-sub { font-size: 0.9rem; margin-bottom: 24px; padding: 0 4px; }
+  .hero-pill { font-size: 0.75rem; padding: 5px 14px; margin-bottom: 20px; }
+  .btn-cta-blue, .btn-cta-orange, .btn-outline { padding: 12px 24px; font-size: 0.9rem; width: 100%; justify-content: center; }
+  .hero-actions { flex-direction: column; align-items: stretch; width: 100%; gap: 10px; padding: 0; }
+  .hero-demo { margin-top: 32px; }
+  .demo-card { min-width: auto; width: 90%; max-width: 280px; }
+  
+  /* Navigation — compact mobile navbar */
+  .navbar-links { display: none; }
+  .navbar-inner { height: 56px; gap: 8px; padding: 0; }
+  .navbar-logo { font-size: 0.95rem; gap: 8px; }
+  .logo-mark { width: 30px; height: 30px; border-radius: 8px; }
+  .nav-badge { font-size: 0.65rem; padding: 3px 8px; }
+  .navbar-cta { padding: 7px 14px; font-size: 0.78rem; }
+  .navbar-actions { gap: 6px; }
+  
+  /* Auth Pages */
+  .auth-card { padding: 32px 20px; border-radius: 16px; }
+  .auth-title { font-size: 1.3rem; }
+  
+  /* Tool Pages */
+  .tool-page { padding: 30px 16px 60px; }
+  .tool-card { padding: 24px 16px; border-radius: 16px; }
+  .tool-header h2 { font-size: 1.4rem; }
+  .tool-header p { font-size: 0.85rem; }
+  .upload-zone { padding: 24px 16px; }
+  .upload-icon-wrap { width: 56px; height: 56px; margin-bottom: 12px; }
+  .step-box { padding: 16px; margin-top: 16px; }
+  
+  /* Format mode buttons */
+  .yn-btn { padding: 12px !important; }
+  
+  /* Journal grid */
+  .journal-grid { grid-template-columns: 1fr !important; }
+  
+  /* Score Pre-check */
+  .pre-check-wrap { padding: 0 16px; margin: 30px auto; }
+  .pre-check-card { padding: 24px 16px; }
+  .pre-check-card h2 { font-size: 1.25rem; }
+  .gauge-container { width: 150px; height: 150px; }
+  .gauge-number { font-size: 2.5rem; }
+  
+  /* Progress Screen */
+  .progress-screen { padding: 20px 16px; min-height: calc(100vh - 120px); }
+  .progress-card { padding: 24px 16px; }
+  .progress-title { font-size: 1.1rem; }
+  .progress-step { padding: 8px 10px; }
+  .progress-step-label { font-size: 0.85rem; }
+  .progress-filename { max-width: 200px; }
+  
+  /* Results Screen */
+  .score-gauge-wrap { flex-direction: column; align-items: flex-start; }
+  .bar-label { width: 90px; font-size: 0.75rem; }
+  .steps-row::before { display: none; }
+  .rs-header-left h2 { font-size: 1.25rem; }
+  .h-score-big { font-size: 3rem; }
+  .h-score-unit { font-size: 1.25rem; }
+  .h-score-header h3 { font-size: 1.1rem; }
+  .result-card, .rs-panel, .transformation-report, .scp-summary, .pre-check-card { padding: 16px; }
+  .rs-screen { width: 100%; padding: 16px 0; }
+  
+  /* TipTap Editor */
+  .tiptap-editor { padding: 24px 16px; font-size: 1rem; line-height: 1.6; }
+  
+  /* Features */
+  .features { padding: 40px 0; min-height: auto; }
+  .features-grid { grid-template-columns: 1fr; gap: 12px; }
+  .feature-card { padding: 20px 16px; }
+  
+  /* How it works */
+  .how-it-works { padding: 40px 0; min-height: auto; }
+  .steps-row { grid-template-columns: 1fr; gap: 24px; }
+  .step-circle { width: 56px; height: 56px; }
+  
+  /* Misc */
+  .file-selected { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .file-remove { width: 100%; text-align: center; }
+  .loading-section { padding: 32px 20px; margin: 40px auto; }
+  .error-card { padding: 32px 24px; margin: 40px auto; }
+  .footer { font-size: 0.75rem; padding: 20px 16px; }
 }
 
 /* ============================================================
@@ -1106,7 +1197,7 @@ input, select { font-family: var(--font); }
   height: 44px;
   border-radius: 50%;
   border: 3px solid var(--border);
-  border-top-color: var(--primary);
+  border-top-color: var(--orange);
   animation: spin 0.9s linear infinite;
 }
 .progress-check-wrap {
@@ -1128,7 +1219,7 @@ input, select { font-family: var(--font); }
   color: var(--text-secondary);
 }
 .progress-journal span {
-  color: var(--primary);
+  color: var(--orange);
   font-weight: 600;
 }
 .progress-filename {
@@ -1159,8 +1250,8 @@ input, select { font-family: var(--font); }
   transition: all 0.35s ease;
 }
 .progress-step.active {
-  background: var(--primary-light);
-  border: 1px solid rgba(37, 99, 235, 0.15);
+  background: var(--orange-light);
+  border: 1px solid rgba(249, 115, 22, 0.15);
 }
 .progress-step.done {
   opacity: 0.7;
@@ -1181,7 +1272,7 @@ input, select { font-family: var(--font); }
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  border: 2px solid var(--primary);
+  border: 2px solid var(--orange);
   border-top-color: transparent;
   animation: spin 0.8s linear infinite;
 }
@@ -1201,7 +1292,7 @@ input, select { font-family: var(--font); }
   margin-top: 1px;
 }
 .progress-step.done .progress-step-icon { color: var(--success); }
-.progress-step.active .progress-step-icon { color: var(--primary); }
+.progress-step.active .progress-step-icon { color: var(--orange); }
 .progress-step.pending .progress-step-icon { color: var(--text-muted); }
 
 .progress-step-content {
@@ -1232,7 +1323,7 @@ input, select { font-family: var(--font); }
 .typewriter-cursor {
   display: inline-block;
   animation: blink 0.7s step-end infinite;
-  color: var(--primary);
+  color: var(--orange);
   font-weight: 300;
   margin-left: 1px;
 }
@@ -1254,7 +1345,7 @@ input, select { font-family: var(--font); }
 .progress-bar-fill {
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, var(--primary), #60A5FA);
+  background: linear-gradient(90deg, var(--orange), #FCD34D);
   transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
 }
@@ -1831,18 +1922,25 @@ input, select { font-family: var(--font); }
 @media (max-width: 768px) {
   .rs-mobile-tabs { display: flex; }
   .rs-header-actions .rs-dl-dropdown { display: none; }
+  .rs-header { gap: 10px; }
   .rs-new-btn { padding: 8px 14px; font-size: 0.8rem; }
+  .rs-edit-btn { padding: 8px 14px; font-size: 0.8rem; }
   .rs-body {
     grid-template-columns: 1fr;
+    gap: 16px;
   }
   .rs-col { display: none; }
   .rs-col.mobile-visible { display: block; }
   .rs-col-preview { position: static; }
-  .rs-col-preview .rs-panel { height: auto; min-height: 450px; }
-  .rs-col-score { max-height: none; overflow-y: visible; }
-  .rs-preview-iframe { min-height: 450px; }
+  .rs-col-preview .rs-panel { height: auto; min-height: 400px; padding: 16px; }
+  .rs-col-score { max-height: none; overflow-y: visible; padding-right: 0; }
+  .rs-preview-iframe { min-height: 400px; }
   .rs-tab-label { display: none; }
-  .rs-tab { font-size: 0.72rem; }
+  .rs-tab { font-size: 0.72rem; padding: 6px; }
+  
+  /* Make sure wide score cards stack well */
+  .horizontal-score-card { gap: 20px; flex-direction: column; }
+  .h-score-main, .h-score-breakdown { width: 100%; min-width: auto; }
 }
 
 /* ============================================================
